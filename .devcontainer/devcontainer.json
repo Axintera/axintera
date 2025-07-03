@@ -1,0 +1,17 @@
+{
+  "name": "Python 3.11 + Poetry",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "."
+  },
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+  "settings": {
+    // use the container’s Python automatically
+    "python.defaultInterpreterPath": "/usr/local/bin/python"
+  },
+  "extensions": [
+    "ms-python.python"
+  ],
+  "remoteUser": "vscode"
+}
