@@ -1,0 +1,31 @@
+[project]
+name = "axintera"
+version = "0.1.0"
+description = "Axintera – Reppo solver with reputation layer"
+authors = [
+    {name = "Martel Axe",email = "you@example.com"}
+]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = "^3.12"
+dependencies = [
+    "web3 (>=7.12.0,<8.0.0)",
+    "requests (>=2.32.4,<3.0.0)",
+    "python-dotenv (>=1.1.1,<2.0.0)",
+    "click (>=8.2.1,<9.0.0)",
+    "json5 (>=0.12.0,<0.13.0)",
+    "sqlmodel (>=0.0.24,<0.0.25)",
+    "fastapi (>=0.115.14,<0.116.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.4.1"
+pytest-mock = "^3.14.1"
+ruff = "^0.12.2"
+black = "^25.1.0"
+
