@@ -24,9 +24,18 @@ from nftAuthorizer import NFTAuthorizer
 from submitSolution import SolutionSubmitter
 
 # ─── Axintera reputation helper (single-file) ─────────────────────────
-import reputation
+# solverNode.py  – top of file, just after the other imports
+import threading, asyncio, uvicorn, reputation
+import score_service                   # <- the FastAPI app you created
 
-reputation.init_db()        # make sure state/stats.db exists
+# kick off background tasks once at start-up
+reputation.init_db()
+threading.Thread(target=lambda: asyncio.run(reputation.hourly_recalc()),
+                 daemon=True).start()
+threading.Thread(target=lambda: uvicorn.run("score_service:app",
+                                            host="0.0.0.0", port=8000,
+                                            log_level="warning"),
+                 daemon=True).start()
 
 # ─── logging config ───────────────────────────────────────────────────
 logging.basicConfig(
