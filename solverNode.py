@@ -1,180 +1,213 @@
 # solverNode.py
-import os
+"""
+Main orchestration script for the Reppo solver node + Axintera reputation layer
+───────────────────────────────────────────────────────────────────────────────
+Modes
+ • MOCK  – local run, fake wallet, no chain/IPFS
+ • TEST  – real data generation, skips on-chain calls
+ • PROD  – full pipeline (NFT check, IPFS, submitSolution)
+
+Reputation layer
+ • Creates   state/stats.db            (see reputation.py)
+ • Records   served / success counters per wallet address
+"""
+
+import os, json, time, logging
+from typing import Dict, Optional, List, Type
 from dotenv import load_dotenv
+
+# ─── Reppo skeleton imports ────────────────────────────────────────────
 from rfdListener import RFDListener
-from datasolver import DataSolver
+from datasolver   import DataSolver
 from ipfsUploader import upload_to_ipfs
 from nftAuthorizer import NFTAuthorizer
 from submitSolution import SolutionSubmitter
-from typing import Dict, Optional, List, Type
-import json
-import random
-import time
-from datetime import datetime
-import logging
 
-# Configure logging
+# ─── Axintera reputation helper (single-file) ─────────────────────────
+import reputation
+
+reputation.init_db()        # make sure state/stats.db exists
+
+# ─── logging config ───────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
+LOGGER = logging.getLogger("SolverNode")
 
+# ──────────────────────────────────────────────────────────────────────
 class SolverNode:
-    def __init__(self, test_mode: bool = False, mock_mode: bool = False, mcp_tools: Optional[List[Type]] = None):
-        """Initialize the solver node
-        
-        Args:
-            test_mode: Run in test mode (uses real data generation)
-            mock_mode: Run in mock mode (uses mock data and responses)
-            mcp_tools: List of MCP tool classes to use (optional, e.g. [DynamoDBTool])
+    def __init__(
+        self,
+        test_mode: bool = False,
+        mock_mode: bool = False,
+        mcp_tools: Optional[List[Type]] = None,
+    ):
         """
-        self.logger = logging.getLogger('SolverNode')
-        self.test_mode = test_mode
-        self.mock_mode = mock_mode
-        # MCP tools should be passed in by the user or config if needed
-        self.mcp_tools = mcp_tools
-        # Load environment variables
+        Args:
+            test_mode: process a local sample RFD, no chain calls
+            mock_mode: generate mock data + mock tx hash (dev only)
+            mcp_tools: optional list of MCP tool classes to inject
+        """
+        self.test_mode  = test_mode
+        self.mock_mode  = mock_mode
+        self.mcp_tools  = mcp_tools
+
         load_dotenv()
-        # Initialize components based on mode
-        self._initialize_components()
-        # Print mode information
-        self._print_mode_info()
-    
-    def _initialize_components(self):
-        """Initialize node components based on mode"""
-        # Set wallet address
-        if self.mock_mode:
-            self.wallet_address = "0xMockWalletAddress"
-        else:
-            self.wallet_address = os.getenv("WALLET_ADDRESS")
-            if not self.wallet_address:
-                raise ValueError("WALLET_ADDRESS must be set in .env file")
-        
-        # Initialize solver with appropriate configuration
+
+        # wallet address
+        self.wallet_address = (
+            "0xMockWalletAddress" if self.mock_mode else os.getenv("WALLET_ADDRESS")
+        )
+        if not self.wallet_address:
+            raise ValueError("WALLET_ADDRESS must be set in .env")
+
+        # core solver
         self.solver = DataSolver.from_env(mock_mode=self.mock_mode)
-        
-        # Initialize other components based on mode
-        if self.test_mode or self.mock_mode:
+
+        # supporting components (skip in mock / test)
+        if self.mock_mode or self.test_mode:
             self.authorizer = None
-            self.submitter = None
-            self.listener = None
+            self.submitter  = None
+            self.listener   = None
         else:
             self.authorizer = NFTAuthorizer()
-            self.submitter = SolutionSubmitter()
-            self.listener = RFDListener()
-    
-    def _print_mode_info(self):
-        """Print information about the current mode"""
+            self.submitter  = SolutionSubmitter()
+            self.listener   = RFDListener()
+
+        self._print_mode_banner()
+
+    # ──────────────────────────────────────────────────────────────
+    def _print_mode_banner(self):
         if self.mock_mode:
-            print("\nRunning in MOCK mode:")
-            print("- Using mock data generation")
-            print("- Using mock blockchain responses")
-            print("- No external services required")
-            print(f"- Using mock wallet: {self.wallet_address}")
+            mode = "MOCK"
+            details = [
+                "mock data generation",
+                "mock blockchain responses",
+                "no external services",
+            ]
         elif self.test_mode:
-            print("\nRunning in TEST mode:")
-            print("- Processing sample RFD file")
-            print("- Using real data generation (if available)")
-            print("- Skipping blockchain interactions")
-            print(f"- Using wallet: {self.wallet_address}")
+            mode = "TEST"
+            details = [
+                "sample_rfd.json → dataset",
+                "real data generation (if available)",
+                "no blockchain interactions",
+            ]
         else:
-            print("\nRunning in PRODUCTION mode:")
-            print("- Using real data generation")
-            print("- Using real blockchain interactions")
-            print("- Requires Reppo NFT ownership")
-            print(f"- Using wallet: {self.wallet_address}")
-    
+            mode = "PRODUCTION"
+            details = [
+                "real data generation",
+                "full blockchain interactions",
+                "requires Reppo NFT ownership",
+            ]
+
+        print(
+            f"\nRunning in {mode} mode:\n"
+            + "\n".join(f"- {d}" for d in details)
+            + f"\n- wallet: {self.wallet_address}\n"
+        )
+
+    # ──────────────────────────────────────────────────────────────
     def process_rfd(self, rfd: Dict) -> Optional[Dict]:
-        """Process an RFD and generate a solution
-        
-        Args:
-            rfd: The RFD to process
-            
-        Returns:
-            Optional[Dict]: Processing results if successful, None otherwise
-        """
+        """Generate + store dataset, submit solution, update reputation."""
         rfd_id = rfd.get("rfd_id", "unknown")
-        self.logger.info(f"Processing RFD #{rfd_id} with wallet {self.wallet_address}")
-        
-        # Skip NFT check in test/mock modes
+        LOGGER.info("Processing RFD #%s", rfd_id)
+
+        # NFT gate (prod only)
         if self.authorizer and not self.authorizer.has_nft(self.wallet_address):
-            self.logger.warning(f"Wallet {self.wallet_address} does not own a Reppo NFT. Skipping RFD #{rfd_id}")
+            LOGGER.warning("Wallet %s lacks Reppo NFT – skipping", self.wallet_address)
+            reputation.update_stats(self.wallet_address.lower(), ok=False)
             return None
-        
+
         try:
-            # Generate dataset
+            # 1. create dataset
             dataset_path = self.solver.solve(rfd)
             if not dataset_path:
-                self.logger.error(f"Failed to generate dataset for RFD #{rfd_id}")
-                return None
-            
-            # In mock mode, generate mock storage and transaction info
+                raise RuntimeError("datasolver returned empty path")
+
+            # 2. mock path
             if self.mock_mode:
-                mock_cid = f"mockCID_{rfd_id}_{int(time.time())}"
-                mock_tx = f"0x{'0' * 40}_{rfd_id}_{int(time.time())}"
-                results = {
+                cid = f"mockCID_{rfd_id}_{int(time.time())}"
+                tx  = f"0x{'0'*40}_{rfd_id}_{int(time.time())}"
+                result = {
                     "rfd_id": rfd_id,
                     "wallet": self.wallet_address,
                     "dataset_path": dataset_path,
-                    "storage_uri": f"ipfs://{mock_cid}",
-                    "tx_hash": mock_tx
+                    "storage_uri": f"ipfs://{cid}",
+                    "tx_hash": tx,
                 }
+
+            # 3. prod / test path
             else:
-                # Upload to IPFS
                 storage_uri = upload_to_ipfs(dataset_path)
                 if not storage_uri:
-                    self.logger.error(f"Failed to upload dataset for RFD #{rfd_id}")
-                    return None
-                
-                # Submit solution
-                tx_hash = self.submitter.submit_solution(rfd_id, storage_uri)
-                if not tx_hash:
-                    self.logger.error(f"Failed to submit solution for RFD #{rfd_id}")
-                    return None
-                
-                results = {
+                    raise RuntimeError("IPFS upload failed")
+
+                if self.submitter:
+                    tx_hash = self.submitter.submit_solution(rfd_id, storage_uri)
+                    if not tx_hash:
+                        raise RuntimeError("submitSolution returned None")
+                else:  # test_mode
+                    tx_hash = "0xTESTMODE_TX"
+
+                result = {
                     "rfd_id": rfd_id,
                     "wallet": self.wallet_address,
                     "dataset_path": dataset_path,
                     "storage_uri": storage_uri,
-                    "tx_hash": tx_hash
+                    "tx_hash": tx_hash,
                 }
-            
-            self.logger.info(f"Successfully processed RFD #{rfd_id}")
-            return results
-            
-        except Exception as e:
-            self.logger.error(f"Error processing RFD #{rfd_id}: {str(e)}")
+
+            LOGGER.info("✅ RFD #%s processed", rfd_id)
+            reputation.update_stats(self.wallet_address.lower(), ok=True)
+            return result
+
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.error("❌ RFD #%s failed: %s", rfd_id, exc)
+            reputation.update_stats(self.wallet_address.lower(), ok=False)
             return None
-    
+
+    # ──────────────────────────────────────────────────────────────
     def run(self):
-        """Run the Solver Node"""
         if self.mock_mode or self.test_mode:
-            self._run_test_mode()
+            self._run_local_mode()
         else:
-            self._run_production_mode()
-    
-    def _run_test_mode(self):
-        """Run in test/mock mode"""
+            self._run_production()
+
+    # local = mock or test
+    def _run_local_mode(self):
         print("\nProcessing sample RFD...")
         try:
-            with open("sample_rfd.json") as f:
-                sample_rfd = json.load(f)
-            results = self.process_rfd(sample_rfd)
-            if results:
-                print(f"Successfully processed sample RFD: {results}")
-            else:
-                print("Failed to process sample RFD")
+            with open("sample_rfd.json", "r", encoding="utf-8") as f:
+                sample = json.load(f)
         except FileNotFoundError:
-            print("Error: sample_rfd.json not found. Please create a sample RFD file.")
-        except Exception as e:
-            print(f"Error processing sample RFD: {str(e)}")
-    
-    def _run_production_mode(self):
-        """Run in production mode"""
-        if not self.authorizer:
-            raise RuntimeError("Cannot run in production mode without authorizer")
-        
-        print("Production mode: Starting RFD listener")
+            print("sample_rfd.json not found – create one first.")
+            return
+
+        result = self.process_rfd(sample)
+        if result:
+            print(f"Sample RFD processed OK:\n{result}")
+        else:
+            print("Sample RFD failed – see logs.")
+
+    # production
+    def _run_production(self):
+        if not self.listener:
+            raise RuntimeError("Listener not initialised (should not happen)")
+
+        print("Production mode – starting blockchain listener…")
         self.listener.listen_for_rfds(self.process_rfd)
+
+
+# ─────────────── convenience CLI ─────────────────────────────
+if __name__ == "__main__":
+    import argparse, sys
+
+    argp = argparse.ArgumentParser()
+    argp.add_argument("--test", action="store_true", help="run sample_rfd.json")
+    argp.add_argument("--mock", action="store_true", help="run with fake data/tx")
+    args = argp.parse_args()
+
+    node = SolverNode(test_mode=args.test, mock_mode=args.mock)
+    node.run()
