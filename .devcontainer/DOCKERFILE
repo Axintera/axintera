@@ -1,12 +1,8 @@
-# Use the official Microsoft Python image as a base
-FROM mcr.microsoft.com/devcontainers/python:3.11
+# syntax=docker/dockerfile:1
+FROM mcr.microsoft.com/devcontainers/python:3.12
 
-# Install Poetry via the official installer
-RUN curl -sSL https://install.python-poetry.org | POETRY_HOME=/opt/poetry python3 - \
- && ln -s /opt/poetry/bin/poetry /usr/local/bin/poetry
+# ─ optional: install Poetry system-wide exactly as before ─
+RUN curl -sSL https://install.python-poetry.org | POETRY_HOME=/opt/poetry python3 - && \
+    ln -s /opt/poetry/bin/poetry /usr/local/bin/poetry
 
-# (Optional) Pre-create your project folder
-WORKDIR /workspace
-
-# Ensure Poetry’s virtualenvs live inside the project (so you don’t hunt for them)
-RUN poetry config virtualenvs.in-project true
+# (the image already uses user "vscode" and sets PATH correctly)
