@@ -1,46 +1,44 @@
 #!/usr/bin/env python3
 """
-solver_server.py
-────────────────
-FastAPI service that wraps the existing SolverNode class.
-
-▪ POST /execute_rfd –> SolverNode.process_rfd(…)
-▪ On startup registers tool 'yield_matrix' with the mock router
+Tiny FastAPI wrapper around SolverNode
+* POST /execute_rfd – body = the RFD JSON
+* registers itself with the mock router on startup
 """
 
-import os, json, logging, httpx, uvicorn
+import os, json, logging, httpx, asyncio
 from fastapi import FastAPI, HTTPException
-from solverNode import SolverNode                     # ← your long class file
+import uvicorn
 
-log  = logging.getLogger("solver-api")
-node = SolverNode()                                   # production instance
+from solverNode import SolverNode
 
-app = FastAPI(title="Reppo Solver Node")
+log = logging.getLogger("solver-api")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 
-# ───────────────────────── REST entrypoint ──────────────────────────
-@app.post("/execute_rfd")
-async def execute_rfd(rfd: dict):
-    """Router (or Q) sends Requests-for-Data here"""
-    result = node._process_rfd(rfd)         # ← use the real method
-    if result is None:
-        raise HTTPException(500, "Solver failed")
-    return result                                     # a plain dict
+node = SolverNode()
+app  = FastAPI(title="Reppo Solver Node")
 
-# ───────────────────── register with router on start ───────────────
-ROUTER_URL  = os.getenv("MCP_SERVER_URL", "http://localhost:8000")
-SOLVER_PORT = int(os.getenv("SOLVER_PORT", 8001))
-SOLVER_URL  = os.getenv("SOLVER_URL", f"http://localhost:{SOLVER_PORT}")
-
+# --------------------------------------------------------------------------- #
 @app.on_event("startup")
-async def register_tool():
-    payload = {"solver_url": SOLVER_URL, "tools": ["yield_matrix"]}
+async def _register_with_router() -> None:
+    router = os.getenv("MCP_SERVER_URL", "http://localhost:8000")
+    my_url = os.getenv("SOLVER_URL",      "http://localhost:8001")
+    payload = {"solver_url": my_url, "tools": ["yield_matrix"]}
     try:
         async with httpx.AsyncClient() as cli:
-            res = await cli.post(f"{ROUTER_URL}/register", json=payload, timeout=10)
-            res.raise_for_status()
-        log.info("✔ Registered 'yield_matrix' with router %s", ROUTER_URL)
+            await cli.post(f"{router}/register", json=payload, timeout=5)
+        log.info("✔ Registered 'yield_matrix' with router %s", router)
     except Exception as exc:
         log.error("✖ Could not register with router – %s", exc)
 
+# --------------------------------------------------------------------------- #
+@app.post("/execute_rfd")
+async def execute_rfd(rfd: dict):
+    res = node.process_rfd(rfd)
+    if not res:
+        raise HTTPException(status_code=500, detail="Solver failed")
+    return res
+
+# --------------------------------------------------------------------------- #
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=SOLVER_PORT)
+    port = int(os.getenv("SOLVER_PORT", "8001"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
