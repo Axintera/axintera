@@ -1,277 +1,195 @@
 #!/usr/bin/env python3
 """
-Standard MCP Server using stdio (JSON-RPC over stdin/stdout)
-This is the correct format for MCP servers
+Standard MCP Server (JSON-RPC 2.0 over stdin/stdout) for Amazon Q
+
+* Advertises three tools:
+    • generate_data   (synthetic demo – local)
+    • query_data      (synthetic demo – local)
+    • yield_matrix    (REAL – forwards to Reppo router /fulfill)
 """
 
-import json
-import sys
-import logging
-from typing import Dict, Any
+import json, sys, logging, os, httpx
+from typing import Dict, Any, List
 
-# Set up logging to stderr so it doesn't interfere with JSON-RPC
-logging.basicConfig(level=logging.INFO, stream=sys.stderr, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("MCPServer")
+# ─────────────────────────  logging  ──────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    stream=sys.stderr,
+    format="%(asctime)s  %(levelname)s  %(message)s",
+)
+log = logging.getLogger("mcp-server")
 
+# ─────────────────────────  config  ───────────────────────────
+ROUTER = os.getenv("ROUTER_URL", "http://localhost:8000")  # mock_mcp_server
+
+YIELD_INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "chains": {"type": "array", "items": {"type": "string"}},
+        "assets": {"type": "array", "items": {"type": "string"}},
+        "depth":  {"type": "string"},
+    },
+    "required": ["chains", "assets"],
+}
+
+# ─────────────────────────  server class  ─────────────────────
 class MCPServer:
-    def __init__(self):
+    def __init__(self) -> None:
         self.initialized = False
-        logger.info("MCP Server starting...")
-    
-    def handle_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle incoming MCP requests"""
-        method = request.get("method")
-        request_id = request.get("id")
-        params = request.get("params", {})
-        
-        logger.info(f"Handling method: {method}")
-        
+
+    # ---------- tool dispatch -------------------------------------------------
+    def _local_tools(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "generate_data",
+                "description": "Generate synthetic data based on schema",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "schema": {"type": "object"},
+                        "count":  {"type": "integer", "default": 10},
+                    },
+                    "required": ["schema"],
+                },
+            },
+            {
+                "name": "query_data",
+                "description": "Query existing data",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "table": {"type": "string"},
+                    },
+                    "required": ["query"],
+                },
+            },
+            {
+                "name": "yield_matrix",
+                "description": "Aggregates on-chain yield opportunities",
+                "inputSchema": YIELD_INPUT_SCHEMA,
+            },
+        ]
+
+    # ---------- JSON-RPC handlers --------------------------------------------
+    def handle_request(self, req: Dict[str, Any]) -> Dict[str, Any] | None:
+        mid  = req.get("id")
+        meth = req.get("method")
+        prm  = req.get("params", {})
+
         try:
-            if method == "initialize":
-                return self.handle_initialize(request_id, params)
-            elif method == "initialized":
-                return self.handle_initialized(request_id)
-            elif method == "tools/list":
-                return self.handle_tools_list(request_id)
-            elif method == "tools/call":
-                return self.handle_tools_call(request_id, params)
-            elif method == "resources/list":
-                return self.handle_resources_list(request_id)
-            elif method == "prompts/list":
-                return self.handle_prompts_list(request_id)
-            else:
+            if meth == "initialize":
+                self.initialized = True
                 return {
                     "jsonrpc": "2.0",
-                    "id": request_id,
-                    "error": {
-                        "code": -32601,
-                        "message": f"Method not found: {method}"
-                    }
-                }
-        except Exception as e:
-            logger.error(f"Error handling {method}: {e}")
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {
-                    "code": -32603,
-                    "message": f"Internal error: {str(e)}"
-                }
-            }
-    
-    def handle_initialize(self, request_id: int, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle initialize request"""
-        self.initialized = True
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {
-                    "tools": {},
-                    "resources": {},
-                    "prompts": {}
-                },
-                "serverInfo": {
-                    "name": "solver-node-mcp",
-                    "version": "1.0.0"
-                }
-            }
-        }
-    
-    def handle_initialized(self, request_id: int) -> None:
-        """Handle initialized notification (no response needed)"""
-        logger.info("Client confirmed initialization")
-        return None
-    
-    def handle_tools_list(self, request_id: int) -> Dict[str, Any]:
-        """List available tools"""
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "tools": [
-                    {
-                        "name": "generate_data",
-                        "description": "Generate synthetic data based on schema",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "schema": {"type": "object"},
-                                "count": {"type": "integer", "default": 10}
-                            },
-                            "required": ["schema"]
-                        }
+                    "id": mid,
+                    "result": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
+                        "serverInfo": {"name": "reppo-yield-mcp", "version": "0.2.0"},
                     },
-                    {
-                        "name": "query_data",
-                        "description": "Query existing data",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "query": {"type": "string"},
-                                "table": {"type": "string"}
-                            },
-                            "required": ["query"]
-                        }
-                    }
-                ]
-            }
-        }
-    
-    def handle_tools_call(self, request_id: int, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle tool calls"""
-        tool_name = params.get("name")
-        arguments = params.get("arguments", {})
-        
-        if tool_name == "generate_data":
-            return self.generate_data(request_id, arguments)
-        elif tool_name == "query_data":
-            return self.query_data(request_id, arguments)
-        else:
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {
-                    "code": -32602,
-                    "message": f"Unknown tool: {tool_name}"
                 }
-            }
-    
-    def generate_data(self, request_id: int, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Generate synthetic data"""
-        schema = arguments.get("schema", {})
-        count = arguments.get("count", 10)
-        
-        # Mock data generation
-        mock_data = []
-        for i in range(count):
-            mock_record = {"id": i, "generated": True}
-            # Add fields based on schema
-            if "properties" in schema:
-                for prop, prop_schema in schema["properties"].items():
-                    if prop_schema.get("type") == "string":
-                        mock_record[prop] = f"sample_{prop}_{i}"
-                    elif prop_schema.get("type") == "number":
-                        mock_record[prop] = i * 10.5
-                    elif prop_schema.get("type") == "integer":
-                        mock_record[prop] = i
-                    elif prop_schema.get("type") == "boolean":
-                        mock_record[prop] = i % 2 == 0
-            mock_data.append(mock_record)
-        
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": f"Generated {count} records based on schema"
-                    },
-                    {
-                        "type": "resource",
-                        "resource": {
-                            "uri": "data://generated",
-                            "mimeType": "application/json",
-                            "text": json.dumps(mock_data, indent=2)
-                        }
-                    }
-                ]
-            }
-        }
-    
-    def query_data(self, request_id: int, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Query data"""
-        query = arguments.get("query", "")
-        table = arguments.get("table", "default")
-        
-        # Mock query response
-        mock_results = [
-            {"id": 1, "name": "Sample Record 1", "value": 100},
-            {"id": 2, "name": "Sample Record 2", "value": 200}
-        ]
-        
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": f"Query executed: {query} on table: {table}"
-                    },
-                    {
-                        "type": "resource",
-                        "resource": {
-                            "uri": f"data://{table}",
-                            "mimeType": "application/json",
-                            "text": json.dumps(mock_results, indent=2)
-                        }
-                    }
-                ]
-            }
-        }
-    
-    def handle_resources_list(self, request_id: int) -> Dict[str, Any]:
-        """List available resources"""
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "resources": []
-            }
-        }
-    
-    def handle_prompts_list(self, request_id: int) -> Dict[str, Any]:
-        """List available prompts"""
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "prompts": []
-            }
-        }
-    
-    def run(self):
-        """Main server loop"""
-        logger.info("MCP Server ready and listening on stdin...")
-        
-        try:
-            while True:
-                line = sys.stdin.readline()
-                if not line:  # EOF
-                    logger.info("EOF received, shutting down")
-                    break
-                
-                line = line.strip()
-                if not line:
-                    continue
-                
-                try:
-                    request = json.loads(line)
-                    response = self.handle_request(request)
-                    
-                    if response is not None:  # Some methods don't return responses
-                        print(json.dumps(response), flush=True)
-                        
-                except json.JSONDecodeError as e:
-                    logger.error(f"Invalid JSON received: {e}")
-                    error_response = {
-                        "jsonrpc": "2.0",
-                        "id": None,
-                        "error": {
-                            "code": -32700,
-                            "message": "Parse error"
-                        }
-                    }
-                    print(json.dumps(error_response), flush=True)
-                    
-        except KeyboardInterrupt:
-            logger.info("Received interrupt, shutting down")
-        except Exception as e:
-            logger.error(f"Unexpected error: {e}")
 
+            if meth == "initialized":
+                return None  # notification
+
+            if meth == "tools/list":
+                return {
+                    "jsonrpc": "2.0",
+                    "id": mid,
+                    "result": {"tools": self._local_tools()},
+                }
+
+            if meth == "tools/call":
+                name = prm.get("name")
+                args = prm.get("arguments", {})
+                if name == "generate_data":
+                    return self._gen_data(mid, args)
+                if name == "query_data":
+                    return self._query_data(mid, args)
+                if name == "yield_matrix":
+                    return self._call_yield_matrix(mid, args)
+
+                return {
+                    "jsonrpc": "2.0",
+                    "id": mid,
+                    "error": {"code": -32602, "message": f"Unknown tool {name}"},
+                }
+
+            if meth in ("resources/list", "prompts/list"):
+                return {"jsonrpc": "2.0", "id": mid, "result": {meth.split('/')[0]: []}}
+
+            # default – method not found
+            return {
+                "jsonrpc": "2.0",
+                "id": mid,
+                "error": {"code": -32601, "message": f"Method not found: {meth}"},
+            }
+
+        except Exception as exc:  # broad catch so we always send a response
+            log.exception("Handler error")
+            return {
+                "jsonrpc": "2.0",
+                "id": mid,
+                "error": {"code": -32603, "message": str(exc)},
+            }
+
+    # ---------- tool implementations -----------------------------------------
+
+    def _gen_data(self, mid: int, args: Dict[str, Any]) -> Dict[str, Any]:
+        schema = args.get("schema", {})
+        count  = args.get("count", 10)
+        rows = [{"id": i, "dummy": True} for i in range(count)]
+        return self._simple_text_result(mid, f"Generated {count} rows:\n{json.dumps(rows,indent=2)}")
+
+    def _query_data(self, mid: int, args: Dict[str, Any]) -> Dict[str, Any]:
+        q   = args.get("query", "")
+        tbl = args.get("table", "default")
+        mock = [{"id": 1, "name": "foo"}, {"id": 2, "name": "bar"}]
+        return self._simple_text_result(mid, f"Mock query `{q}` on `{tbl}`:\n{json.dumps(mock,indent=2)}")
+
+    def _call_yield_matrix(self, mid: int, args: Dict[str, Any]) -> Dict[str, Any]:
+        # forward to Reppo router
+        rfd = {"service": "yield_matrix", **args}
+        url = f"{ROUTER}/fulfill"
+        try:
+            with httpx.Client(timeout=30) as cli:
+                res = cli.post(url, json=rfd)
+                res.raise_for_status()
+                data = res.json()
+        except Exception as exc:
+            return {
+                "jsonrpc": "2.0",
+                "id": mid,
+                "error": {"code": -32603, "message": f"Router error: {exc}"},
+            }
+
+        return self._simple_text_result(mid, json.dumps(data, indent=2))
+
+    # ---------- helpers ------------------------------------------------------
+    def _simple_text_result(self, mid: int, txt: str) -> Dict[str, Any]:
+        return {
+            "jsonrpc": "2.0",
+            "id": mid,
+            "result": {"content": [{"type": "text", "text": txt}]},
+        }
+
+    # ---------- main loop ----------------------------------------------------
+    def run(self) -> None:
+        log.info("MCP server ready (stdio).")
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                req = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            resp = self.handle_request(req)
+            if resp is not None:
+                print(json.dumps(resp), flush=True)
+
+
+# ─────────────────────────── entrypoint ─────────────────────────
 if __name__ == "__main__":
-    server = MCPServer()
-    server.run()
+    MCPServer().run()
