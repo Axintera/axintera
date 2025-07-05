@@ -1,44 +1,53 @@
 #!/usr/bin/env python3
-"""
-Tiny FastAPI wrapper around SolverNode
-* POST /execute_rfd – body = the RFD JSON
-* registers itself with the mock router on startup
-"""
+# solver_server.py
 
-import os, json, logging, httpx, asyncio
+import os, json, logging, httpx
+from typing import Dict, Any
 from fastapi import FastAPI, HTTPException
-import uvicorn
+from datasolver.providers.mcp.tools.reducer import ReduceAvgTool
+from datasolver.providers.mcp.tools.yield_matrix_tool import YieldMatrixTool
 
-from solverNode import SolverNode
+# ── logging ─────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("solver-api")
 
-log = logging.getLogger("solver-api")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
+# ── config ──────────────────────────────────────────────────────
+MCP_SERVER = os.getenv("MCP_SERVER_URL", "http://localhost:8000")
+SOLVER_URL = os.getenv("SOLVER_URL",     "http://localhost:8001")
+AVAILABLE_TOOLS = [ReduceAvgTool, YieldMatrixTool]
 
-node = SolverNode()
-app  = FastAPI(title="Reppo Solver Node")
+app = FastAPI(title="Reppo Solver Node")
 
-# --------------------------------------------------------------------------- #
+# ── register on startup ─────────────────────────────────────────
 @app.on_event("startup")
-async def _register_with_router() -> None:
-    router = os.getenv("MCP_SERVER_URL", "http://localhost:8000")
-    my_url = os.getenv("SOLVER_URL",      "http://localhost:8001")
-    payload = {"solver_url": my_url, "tools": ["yield_matrix"]}
-    try:
-        async with httpx.AsyncClient() as cli:
-            await cli.post(f"{router}/register", json=payload, timeout=5)
-        log.info("✔ Registered 'yield_matrix' with router %s", router)
-    except Exception as exc:
-        log.error("✖ Could not register with router – %s", exc)
+async def register_with_router():
+    payload = {
+        "solver_url": SOLVER_URL,
+        "tools":      [t().name for t in AVAILABLE_TOOLS]
+    }
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient() as cli:
+                resp = await cli.post(f"{MCP_SERVER}/register", json=payload, timeout=5)
+                resp.raise_for_status()
+                logger.info(f"✔ Registered {payload['tools']} with {MCP_SERVER}")
+                return
+        except Exception as e:
+            logger.warning(f"Router registration failed (#{attempt+1}): {e}")
+    logger.error("✖ Could not register with MCP router after 3 attempts")
 
-# --------------------------------------------------------------------------- #
+# ── core endpoint ───────────────────────────────────────────────
 @app.post("/execute_rfd")
-async def execute_rfd(rfd: dict):
-    res = node.process_rfd(rfd)
-    if not res:
-        raise HTTPException(status_code=500, detail="Solver failed")
-    return res
+async def execute_rfd(rfd: Dict[str,Any]):
+    for ToolCls in AVAILABLE_TOOLS:
+        tool = ToolCls()
+        if tool.validate_rfd(rfd):
+            out = tool.generate(rfd)
+            return {"tool": tool.name, **out}
+    raise HTTPException(status_code=404, detail=f"No tool for service '{rfd.get('service')}'")
 
-# --------------------------------------------------------------------------- #
-if __name__ == "__main__":
-    port = int(os.getenv("SOLVER_PORT", "8001"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+# ── launcher ───────────────────────────────────────────────────
+if __name__=="__main__":
+    import uvicorn
+    port = int(os.getenv("SOLVER_PORT","8001"))
+    uvicorn.run("solver_server:app", host="0.0.0.0", port=port, log_level="info")
