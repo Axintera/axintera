@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "solver_node": {
+      "command": "python",
+      "args": [
+        "stdio_mcp_server.py"
+      ],
+      "cwd": "/mnt/c/development/Axintera/solver-node",
+      "env": {},
+      "timeout": 30000,
+      "disabled": false
+    }
+  }
+}

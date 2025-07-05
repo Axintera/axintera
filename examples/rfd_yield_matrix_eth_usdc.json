@@ -1,0 +1,9 @@
+{
+    "service": "yield_matrix",
+    "chains": ["eth", "arb", "sol"],
+    "assets": ["ETH", "USDC"],
+    "depth": "top_5",
+    "metrics": ["apy", "tvl", "risk"],
+    "window": "24h"
+  }
+  
