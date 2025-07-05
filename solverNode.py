@@ -1,222 +1,143 @@
 # solverNode.py
 """
-Main orchestration script for the Reppo solver node + Axintera reputation layer
-───────────────────────────────────────────────────────────────────────────────
-Modes
- • MOCK  – local run, fake wallet, no chain/IPFS
- • TEST  – real data generation, skips on-chain calls
- • PROD  – full pipeline (NFT check, IPFS, submitSolution)
+Main orchestration script for the Reppo solver node.
 
-Reputation layer
- • Creates   state/stats.db            (see reputation.py)
- • Records   served / success counters per wallet address
+This script runs the solver as a persistent API server. On startup, it
+registers itself with the Mock MCP Server (defined in the .env file).
+It then listens for incoming RFD execution requests on the /execute_rfd endpoint.
 """
+import os
+import json
+import time
+import logging
+from typing import Dict, Any, List, Type
+from contextlib import asynccontextmanager
 
-import os, json, time, logging
-from typing import Dict, Optional, List, Type
+import httpx
 from dotenv import load_dotenv
+from fastapi import FastAPI, Request, HTTPException
+import uvicorn
 
-# ─── Reppo skeleton imports ────────────────────────────────────────────
-from rfdListener import RFDListener
-from datasolver   import DataSolver
-from ipfsUploader import upload_to_ipfs
-from nftAuthorizer import NFTAuthorizer
-from submitSolution import SolutionSubmitter
+# --- Project-specific Imports ---
+from datasolver.providers.mcp.client import MCPClient
+from datasolver.providers.mcp.router import RFDRouter
+from datasolver.providers.mcp.tools.tool import MCPTool
+from datasolver.providers.mcp.tools.reducer import ReduceAvgTool
+import reputation
 
-# ─── Axintera reputation helper (single-file) ─────────────────────────
-# solverNode.py  – top of file, just after the other imports
-import threading, asyncio, uvicorn, reputation
-import score_service                   # <- the FastAPI app you created
-
-# kick off background tasks once at start-up
-reputation.init_db()
-threading.Thread(target=lambda: asyncio.run(reputation.hourly_recalc()),
-                 daemon=True).start()
-threading.Thread(target=lambda: uvicorn.run("score_service:app",
-                                            host="0.0.0.0", port=8000,
-                                            log_level="warning"),
-                 daemon=True).start()
-
-# ─── logging config ───────────────────────────────────────────────────
+# --- Setup Logging and Environment ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 LOGGER = logging.getLogger("SolverNode")
+load_dotenv()
 
-# ──────────────────────────────────────────────────────────────────────
-class SolverNode:
-    def __init__(
-        self,
-        test_mode: bool = False,
-        mock_mode: bool = False,
-        mcp_tools: Optional[List[Type]] = None,
-    ):
-        """
-        Args:
-            test_mode: process a local sample RFD, no chain calls
-            mock_mode: generate mock data + mock tx hash (dev only)
-            mcp_tools: optional list of MCP tool classes to inject
-        """
-        self.test_mode  = test_mode
-        self.mock_mode  = mock_mode
-        self.mcp_tools  = mcp_tools
+# --- Solver Components ---
+# Define what our solver can actually DO. Add all tool classes to this list.
+AVAILABLE_TOOLS: List[Type[MCPTool]] = [
+    ReduceAvgTool,
+]
 
-        load_dotenv()
+# The MCPClient in offline mode acts as a container for our tools.
+mcp_client = MCPClient(tools=AVAILABLE_TOOLS)
+# The RFDRouter uses the client to find the right tool for a job.
+rfd_router = RFDRouter(mcp_client)
 
-        # wallet address
-        self.wallet_address = (
-            "0xMockWalletAddress" if self.mock_mode else os.getenv("WALLET_ADDRESS")
-        )
-        if not self.wallet_address:
-            raise ValueError("WALLET_ADDRESS must be set in .env")
 
-        # core solver
-        self.solver = DataSolver.from_env(mock_mode=self.mock_mode)
+# *** FIX: Use the modern 'lifespan' manager for startup/shutdown events ***
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Lifespan manager for the solver node. Handles startup and shutdown events.
+    """
+    # --- Startup Logic ---
+    mcp_server_url = os.getenv("MCP_SERVER_URL")
+    solver_url = os.getenv("SOLVER_URL")
 
-        # supporting components (skip in mock / test)
-        if self.mock_mode or self.test_mode:
-            self.authorizer = None
-            self.submitter  = None
-            self.listener   = None
-        else:
-            self.authorizer = NFTAuthorizer()
-            self.submitter  = SolutionSubmitter()
-            self.listener   = RFDListener()
+    if not mcp_server_url or not solver_url:
+        LOGGER.warning("MCP_SERVER_URL or SOLVER_URL not found in .env. Skipping registration.")
+        LOGGER.warning("Solver will run but will not be discovered by the MCP network.")
+    else:
+        tool_names = [tool_class().name for tool_class in AVAILABLE_TOOLS]
+        registration_payload = {
+            "solver_url": solver_url,
+            "tools": tool_names
+        }
 
-        self._print_mode_banner()
-
-    # ──────────────────────────────────────────────────────────────
-    def _print_mode_banner(self):
-        if self.mock_mode:
-            mode = "MOCK"
-            details = [
-                "mock data generation",
-                "mock blockchain responses",
-                "no external services",
-            ]
-        elif self.test_mode:
-            mode = "TEST"
-            details = [
-                "sample_rfd.json → dataset",
-                "real data generation (if available)",
-                "no blockchain interactions",
-            ]
-        else:
-            mode = "PRODUCTION"
-            details = [
-                "real data generation",
-                "full blockchain interactions",
-                "requires Reppo NFT ownership",
-            ]
-
-        print(
-            f"\nRunning in {mode} mode:\n"
-            + "\n".join(f"- {d}" for d in details)
-            + f"\n- wallet: {self.wallet_address}\n"
-        )
-
-    # ──────────────────────────────────────────────────────────────
-    def process_rfd(self, rfd: Dict) -> Optional[Dict]:
-        """Generate + store dataset, submit solution, update reputation."""
-        rfd_id = rfd.get("rfd_id", "unknown")
-        LOGGER.info("Processing RFD #%s", rfd_id)
-
-        # NFT gate (prod only)
-        if self.authorizer and not self.authorizer.has_nft(self.wallet_address):
-            LOGGER.warning("Wallet %s lacks Reppo NFT – skipping", self.wallet_address)
-            reputation.update_stats(self.wallet_address.lower(), ok=False)
-            return None
+        LOGGER.info(f"Attempting to register with MCP Server at {mcp_server_url}...")
+        LOGGER.info(f"Registration payload: {json.dumps(registration_payload)}")
 
         try:
-            # 1. create dataset
-            dataset_path = self.solver.solve(rfd)
-            if not dataset_path:
-                raise RuntimeError("datasolver returned empty path")
+            async with httpx.AsyncClient() as client:
+                response = await client.post(f"{mcp_server_url}/register", json=registration_payload, timeout=10)
+                response.raise_for_status()
+                LOGGER.info(f"Successfully registered with MCP Server: {response.json()}")
+        except httpx.RequestError as e:
+            LOGGER.error(f"Could not connect to MCP Server at {mcp_server_url}. Please ensure it's running. Error: {e}")
+        except httpx.HTTPStatusError as e:
+            LOGGER.error(f"Failed to register with MCP Server. Status: {e.response.status_code}, Body: {e.response.text}")
+    
+    # This 'yield' is where the application runs while it's alive.
+    yield
+    
+    # --- Shutdown Logic (if any) ---
+    LOGGER.info("Solver node is shutting down.")
 
-            # 2. mock path
-            if self.mock_mode:
-                cid = f"mockCID_{rfd_id}_{int(time.time())}"
-                tx  = f"0x{'0'*40}_{rfd_id}_{int(time.time())}"
-                result = {
-                    "rfd_id": rfd_id,
-                    "wallet": self.wallet_address,
-                    "dataset_path": dataset_path,
-                    "storage_uri": f"ipfs://{cid}",
-                    "tx_hash": tx,
-                }
-
-            # 3. prod / test path
-            else:
-                storage_uri = upload_to_ipfs(dataset_path)
-                if not storage_uri:
-                    raise RuntimeError("IPFS upload failed")
-
-                if self.submitter:
-                    tx_hash = self.submitter.submit_solution(rfd_id, storage_uri)
-                    if not tx_hash:
-                        raise RuntimeError("submitSolution returned None")
-                else:  # test_mode
-                    tx_hash = "0xTESTMODE_TX"
-
-                result = {
-                    "rfd_id": rfd_id,
-                    "wallet": self.wallet_address,
-                    "dataset_path": dataset_path,
-                    "storage_uri": storage_uri,
-                    "tx_hash": tx_hash,
-                }
-
-            LOGGER.info("✅ RFD #%s processed", rfd_id)
-            reputation.update_stats(self.wallet_address.lower(), ok=True)
-            return result
-
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.error("❌ RFD #%s failed: %s", rfd_id, exc)
-            reputation.update_stats(self.wallet_address.lower(), ok=False)
-            return None
-
-    # ──────────────────────────────────────────────────────────────
-    def run(self):
-        if self.mock_mode or self.test_mode:
-            self._run_local_mode()
-        else:
-            self._run_production()
-
-    # local = mock or test
-    def _run_local_mode(self):
-        print("\nProcessing sample RFD...")
-        try:
-            with open("sample_rfd.json", "r", encoding="utf-8") as f:
-                sample = json.load(f)
-        except FileNotFoundError:
-            print("sample_rfd.json not found – create one first.")
-            return
-
-        result = self.process_rfd(sample)
-        if result:
-            print(f"Sample RFD processed OK:\n{result}")
-        else:
-            print("Sample RFD failed – see logs.")
-
-    # production
-    def _run_production(self):
-        if not self.listener:
-            raise RuntimeError("Listener not initialised (should not happen)")
-
-        print("Production mode – starting blockchain listener…")
-        self.listener.listen_for_rfds(self.process_rfd)
+# --- Initialize FastAPI App ---
+# Pass the lifespan manager to the FastAPI app.
+app = FastAPI(title="Reppo Solver Node", lifespan=lifespan)
 
 
-# ─────────────── convenience CLI ─────────────────────────────
+# --- Core API Endpoints ---
+@app.get("/")
+def read_root():
+    """Root endpoint for health checks."""
+    tool_names = [tool().name for tool in AVAILABLE_TOOLS]
+    return {
+        "message": "Reppo Solver Node is running",
+        "available_tools": tool_names
+    }
+
+@app.post("/execute_rfd")
+async def execute_rfd(rfd: Dict[str, Any], request: Request):
+    """
+    This is the primary endpoint for the solver. The MCP Server will call this.
+    It takes an RFD, uses the router to find the right tool, executes it,
+    and returns the result.
+    """
+    provider_id = request.client.host # Using client IP as a simple provider ID
+    service = rfd.get('service', 'unknown')
+    LOGGER.info(f"Received RFD for service '{service}' from {provider_id}")
+
+    start_time = time.time()
+    ok = False
+    try:
+        # Use the router to fulfill the request
+        result = rfd_router.fulfil(rfd)
+        ok = True
+        elapsed = time.time() - start_time
+        LOGGER.info(f"Successfully fulfilled RFD for '{service}' in {elapsed:.2f}s")
+        # Add elapsed time to the response
+        result['elapsed_seconds'] = elapsed
+        return result
+
+    except Exception as e:
+        LOGGER.error(f"Failed to fulfill RFD for '{service}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Update reputation stats regardless of success or failure
+        reputation.update_stats(provider_id, ok)
+
+
+# --- Main execution block ---
 if __name__ == "__main__":
-    import argparse, sys
-
-    argp = argparse.ArgumentParser()
-    argp.add_argument("--test", action="store_true", help="run sample_rfd.json")
-    argp.add_argument("--mock", action="store_true", help="run with fake data/tx")
-    args = argp.parse_args()
-
-    node = SolverNode(test_mode=args.test, mock_mode=args.mock)
-    node.run()
+    """
+    This allows you to run the solver directly from the command line.
+    `python solverNode.py`
+    """
+    LOGGER.info("Starting Reppo Solver Node...")
+    # Get port from .env, default to 8001
+    port = int(os.getenv("SOLVER_PORT", 8001))
+    uvicorn.run(app, host="0.0.0.0", port=port)

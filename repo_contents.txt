@@ -1,18 +1,203 @@
-===== repo_contents.txt =====
-===== repo_contents.txt =====
+===== mock_mcp_server.py =====
+# mock_mcp_server.py
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, HttpUrl
+from typing import List, Dict, Any
+import httpx
+import logging
+import uvicorn
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("MockMCPServer")
+
+app = FastAPI(title="Mock MCP Server")
+
+SOLVER_REGISTRY: Dict[str, str] = {}
+
+class SolverInfo(BaseModel):
+    solver_url: str
+    tools: List[str]
+
+@app.get("/")
+def read_root():
+    return {"message": "Mock MCP Server is running", "registry": SOLVER_REGISTRY}
+
+@app.post("/register")
+async def register_solver(info: SolverInfo):
+    for tool in info.tools:
+        SOLVER_REGISTRY[tool] = str(info.solver_url)
+        logger.info(f"Registered tool '{tool}' for solver at {info.solver_url}")
+    return {"status": "success", "message": f"Registered {len(info.tools)} tools."}
+
+@app.post("/fulfill")
+async def fulfill_rfd(rfd: Dict[str, Any]):
+    service_needed = rfd.get("service")
+    if not service_needed:
+        raise HTTPException(status_code=400, detail="RFD must include a 'service' key.")
+
+    logger.info(f"Received RFD for service: '{service_needed}'")
+
+    if service_needed not in SOLVER_REGISTRY:
+        logger.error(f"No solver found for service: '{service_needed}'")
+        raise HTTPException(status_code=404, detail=f"No solver registered for service '{service_needed}'")
+
+    solver_url = SOLVER_REGISTRY[service_needed]
+    forward_url = f"{solver_url}/execute_rfd"
+    
+    logger.info(f"Forwarding RFD to solver at: {forward_url}")
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(forward_url, json=rfd, timeout=15.0)
+===== tests/test_ipfs_uploader.py =====
+import pytest
+import requests
+import json
+from unittest.mock import MagicMock
+from ipfsUploader import upload_to_ipfs
+
+def test_upload_success(mocker):
+    """
+    Why: Verifies the happy path for IPFS uploads.
+    How: Mocks requests.post to simulate a successful API response from Pinata.
+    """
+    # Arrange
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {"IpfsHash": "QmTestCID"}
+    mocker.patch('requests.post', return_value=mock_response)
+
+    # Act
+    result_uri = upload_to_ipfs("./sample_rfd.json")
+
+    # Assert
+    assert result_uri == "ipfs://QmTestCID"
+
+def test_upload_failure(mocker):
+    """
+    Why: Ensures errors from Pinata are handled gracefully.
+    How: Mocks requests.post to simulate an API error.
+    """
+    mock_response = MagicMock()
+    mock_response.status_code = 401  # Unauthorized
+    mock_response.text = "Invalid API Key"
+
+    mock_response.json.side_effect = json.JSONDecodeError("Expecting value", "doc", 0)
+    
+    mocker.patch('requests.post', return_value=mock_response)
+
+
+    expected_error_msg = f"Failed to upload to IPFS: 401 - Invalid API Key"
+    with pytest.raises(Exception, match=expected_error_msg):
+        upload_to_ipfs("./sample_rfd.json")===== tests/test_nft_authorizer.py =====
+# tests/test_nft_authorizer.py
+import pytest
+from unittest.mock import MagicMock
+from nftAuthorizer import NFTAuthorizer
+
+@pytest.fixture
+def mock_web3(mocker):
+    # This fixture creates a complex mock for the web3 library
+    mock_w3_instance = MagicMock()
+    mock_w3_instance.is_connected.return_value = True
+    
+    mock_contract_instance = MagicMock()
+    # Mock the chain of calls: .functions.balanceOf(address).call()
+    mock_w3_instance.eth.contract.return_value = mock_contract_instance
+    
+    mocker.patch('nftAuthorizer.Web3', return_value=mock_w3_instance)
+    return mock_w3_instance
+
+def test_has_nft_true(mock_web3, mocker):
+    """
+    Why: Verifies that a wallet with an NFT is correctly identified.
+    How: Mocks the contract call to return a balance > 0.
+    """
+    # Arrange
+    # Configure the final call in the chain to return 1
+    mock_web3.eth.contract.return_value.functions.balanceOf().call.return_value = 1
+    authorizer = NFTAuthorizer() # This will now use our mock_web3
+    
+    # Act
+    has_nft = authorizer.has_nft("0xWalletWithNFT")
+    
+    # Assert
+    assert has_nft is True
+
+def test_has_nft_false(mock_web3, mocker):
+    """
+    Why: Verifies that a wallet without an NFT is correctly identified.
+    How: Mocks the contract call to return a balance of 0.
+    """
+    # Arrange
+    mock_web3.eth.contract.return_value.functions.balanceOf().call.return_value = 0
+    authorizer = NFTAuthorizer()
+    
+    # Act
+    has_nft = authorizer.has_nft("0xWalletWithoutNFT")
+    
+    # Assert
+    assert has_nft is False===== tests/test_router_logic.py =====
+# tests/test_router_logic.py
+import pytest
+from datasolver.providers.mcp.router import RFDRouter
+from datasolver.providers.mcp.client import MCPClient
+from datasolver.providers.mcp.tools.tool import MCPTool
+
+# --- Setup Dummy Tools for Testing ---
+# FIX: Give each tool a unique name to avoid dictionary key collision
+class CheapTool(MCPTool):
+    @property
+    def name(self): return "cheap_tool_service"
+    @property
+    def description(self): return "The cheap version"
+    @property
+    def capabilities(self): return {}
+    # FIX: Validate based on a generic 'task' instead of a conflicting 'service' name
+    def validate_rfd(self, rfd): return rfd.get("task") == "shared_task"
+    def generate_data(self, rfd): return [{"provider": "cheap"}]
+    def generate(self, rfd, **kwargs): return self.generate_data(rfd)
+    def cost(self, rfd): return 10.0
+
+class ExpensiveTool(MCPTool):
+    @property
+    def name(self): return "expensive_tool_service"
+    @property
+    def description(self): return "The expensive version"
+    @property
+    def capabilities(self): return {}
+    def validate_rfd(self, rfd): return rfd.get("task") == "shared_task"
+    def generate_data(self, rfd): return [{"provider": "expensive"}]
+    def generate(self, rfd, **kwargs): return self.generate_data(rfd)
+    def cost(self, rfd): return 100.0
+
+# --- Tests ---
+
+def test_router_chooses_cheapest_tool():
+    """
+    Why: Proves the core 'cost-based routing' feature works.
+    How: Registers two tools that can handle the same task but have different costs.
+    """
+    # The MCPClient will be initialized in offline mode as MCP_SERVER_URL is not set in tests
+    mcp = MCPClient(tools=[CheapTool, ExpensiveTool])
+    router = RFDRouter(mcp)
+    
+    # FIX: Use the generic 'task' key for the RFD
+    rfd = {"task": "shared_task"}
+    result = router.fulfil(rfd)
+    
+    # FIX: The router should have picked the tool with the lower cost. Assert its actual name.
+    assert result["tool"] == "cheap_tool_service"
+===== tests/test_score_service.py =====
 ===== .devcontainer/DOCKERFILE =====
-# Use the official Microsoft Python image as a base
-FROM mcr.microsoft.com/devcontainers/python:3.11
+# syntax=docker/dockerfile:1
+FROM mcr.microsoft.com/devcontainers/python:3.12
 
-# Install Poetry via the official installer
-RUN curl -sSL https://install.python-poetry.org | POETRY_HOME=/opt/poetry python3 - \
- && ln -s /opt/poetry/bin/poetry /usr/local/bin/poetry
+# ─ optional: install Poetry system-wide exactly as before ─
+RUN curl -sSL https://install.python-poetry.org | POETRY_HOME=/opt/poetry python3 - && \
+    ln -s /opt/poetry/bin/poetry /usr/local/bin/poetry
 
-# (Optional) Pre-create your project folder
-WORKDIR /workspace
-
-# Ensure Poetry’s virtualenvs live inside the project (so you don’t hunt for them)
-RUN poetry config virtualenvs.in-project true
+# (the image already uses user "vscode" and sets PATH correctly)
 ===== .devcontainer/devcontainer.json =====
 {
   "name": "Python 3.11 + Poetry",
@@ -157,56 +342,6 @@ The Reppo Solver Node is a key participant in this ecosystem, performing the fol
 
 1. **Listening for RFDs**: Monitors the Reppo Exchange smart contract for new RFD events.
 2. **Generating Datasets**: Uses a data generation service (e.g., Two Ligma server) to create synthetic or real datasets that meet RFD specifications.
-3. **Uploading to IPFS**: Stores datasets on IPFS via Pinata for decentralized, persistent storage.
-4. **Verifying NFT Ownership**: Ensures the node operator owns a Reppo Node NFT, which is required to participate in the network.
-5. **Submitting Solutions**: Submits the IPFS URI of the dataset to the Reppo Exchange smart contract for validation and reward distribution.
-
-The Solver Node is designed to be modular, extensible, and easy to integrate with various data sources, such as Vana (Data DAOs), self-hosted LLMs, OpenGradient (synthetic data), or enterprise datasets.
-
----
-
-## Architecture 🏗️
-
-The Reppo Solver Node is built as a Python application with a modular architecture, separating concerns into distinct components. This design ensures maintainability, scalability, and flexibility for integrating with different data sources and blockchain networks.
-The Solver Node implements a modular architecture designed for the decentralized MCP network:
-
-### Components
-
-The Solver Node consists of the following key components, each implemented in a dedicated Python module:
-
-1. **RFDListener (`rfdListener.py`)**
-   - **Purpose**: Listens for `RFDPosted` events on the Reppo Exchange
-   - **Functionality**: 
-     - Monitors blockchain for new RFDs
-     - Parses RFD intents (data requirements)
-     - Routes to appropriate solver components
-   - **Dependencies**: `web3.py`, `python-dotenv`
-
-2. **DataSolver (`datasolver/`)**
-   - **Purpose**: MCP-compliant data generation and querying
-   - **Functionality**: 
-     - **MCP Provider**: Primary provider for production
-       - DynamoDB Tool: Query and generate data from DynamoDB
-       - Extensible for additional MCP tools
-     - **HuggingFace Provider**: For AI-powered generation
-     - **Mock Provider**: For testing and development
-   - **Dependencies**: `mcp-sdk`, `requests`, `python-dotenv`
-
-3. **IPFSUploader (`ipfsUploader.py`)**
-   - **Purpose**: Uploads datasets to IPFS for decentralized storage.
-   - **Functionality**: Uses the Pinata API to pin files to IPFS, returning an `ipfs://<CID>` URI. Handles file uploads securely with API key authentication.
-   - **Dependencies**: `requests`, `python-dotenv`.
-
-4. **NFTAuthorizer (`nftAuthorizer.py`)**
-   - **Purpose**: Verifies that the node operator's wallet owns a Reppo Node NFT, which is required to submit solutions.
-   - **Functionality**: Queries an ERC-721 NFT contract using `web3.py` to check the `balanceOf` the wallet address. Supports block-specific queries for historical ownership verification.
-   - **Dependencies**: `web3.py`, `python-dotenv`.
-
-5. **SolutionSubmitter (`submitSolution.py`)**
-   - **Purpose**: Submits the dataset's IPFS URI to the Reppo Exchange smart contract.
-   - **Functionality**: Builds, signs, and sends a transaction to the `submitSolution` function of the smart contract, including the RFD ID and IPFS URI. Returns the transaction hash upon success.
-   - **Dependencies**: `web3.py`, `python-dotenv`.
-
 ===== datasolver/__init__.py =====
 """Data solver package for generating datasets from RFDs."""
 
@@ -285,56 +420,6 @@ class DataSolver:
         if provider_type_env:
             config["provider_type"] = provider_type_env
         mcp_tools_env = os.getenv("MCP_TOOLS")
-        if mcp_tools_env:
-            # Assume MCP_TOOLS is a comma-separated list of fully qualified class names (e.g. "datasolver.providers.mcp.tools.dynamodb.DynamoDBTool")
-            mcp_tool_names = mcp_tools_env.split(",")
-            mcp_tools = []
-            for tool_name in mcp_tool_names:
-                try:
-                    mod_name, cls_name = tool_name.rsplit(".", 1)
-                    mod = __import__(mod_name, fromlist=[cls_name])
-                    mcp_tools.append(getattr(mod, cls_name))
-                except (ImportError, AttributeError) as e:
-                    logger.warning(f"Could not import MCP tool {tool_name} (error: {e}). Skipping.")
-            config["mcp_tools"] = mcp_tools
-        # (Add other env overrides as needed, e.g. HUGGINGFACE_TOKEN, etc.)
-        
-        provider_type_str = config.get("provider_type", "huggingface")
-        try:
-            provider_type = ProviderType(provider_type_str)
-        except ValueError as e:
-            logger.warning(f"Invalid provider type {provider_type_str} (error: {e}). Defaulting to HUGGINGFACE.")
-            provider_type = ProviderType.HUGGINGFACE
-        mcp_tools = config.get("mcp_tools", [])
-        return cls(provider_type=provider_type, mcp_tools=mcp_tools)
-
-    def __init__(self, provider_type: ProviderType = ProviderType.HUGGINGFACE, mcp_tools: Optional[List[Type]] = None):
-        """Initialize solver with provider type
-        
-        Args:
-            provider_type: Type of provider to use
-            mcp_tools: List of MCP tool classes to use (only for MCP provider)
-        """
-        if provider_type == ProviderType.MOCK:
-            self.provider = MockProvider()
-        elif provider_type == ProviderType.HUGGINGFACE:
-            from .providers.huggingface import HuggingFaceProvider
-            self.provider = HuggingFaceProvider()
-        elif provider_type == ProviderType.MCP:
-            from .providers.mcp.client import MCPClient
-            self.provider = MCPClient(tools=mcp_tools)
-        else:
-            raise ValueError(f"Unknown provider type: {provider_type}")
-        logger.info(f"Initialized DataSolver with provider: {provider_type.value}")
-    
-    def solve(self, rfd: Dict) -> Optional[str]:
-        """Generate dataset for RFD
-        
-        Args:
-            rfd: Request for data
-            
-        Returns:
-            Path to generated dataset file
 ===== datasolver/providers/huggingface.py =====
 """HuggingFace provider implementation for text generation."""
 
@@ -386,63 +471,23 @@ class HuggingFaceProvider(DataProvider):
                 model=model,
                 tokenizer=tokenizer,
                 device="cpu"  # Use CPU for testing
-            )
-            
-            self.logger.info(f"Initialized HuggingFace provider with model: {self.model}")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to initialize HuggingFace provider: {e}")
-            raise
-    
-    def generate_dataset(self, rfd: Dict) -> Dict[str, Any]:
-        """Generate text dataset using HuggingFace model.
-        
-        Args:
-            rfd: Request for data containing schema and requirements
-            
-        Returns:
-            Generated text dataset
-        """
-        try:
-            if not self._generator:
-                raise RuntimeError("HuggingFace generator not initialized")
-            
-            schema = rfd.get("schema", {})
-            properties = schema.get("properties", {})
-            num_records = rfd.get("num_records", 3)
-            
-            records = []
-            for _ in range(num_records):
-                record = {}
-                for field, field_schema in properties.items():
-                    if field_schema.get("type") == "string":
-                        # Generate text based on field description
-                        prompt = field_schema.get("description", f"Generate {field}")
-                        generated = self._generator(
-                            prompt,
-                            max_length=100,
-                            num_return_sequences=1,
-                            temperature=0.7
-                        )
-                        record[field] = generated[0]["generated_text"].strip()
-                    else:
-                        # For non-string fields, use default values
-                        record[field] = self._get_default_value(field_schema)
-                records.append(record)
-            
-            return {"data": records}
-            
-        except Exception as e:
-            self.logger.error(f"Failed to generate dataset: {e}")
-            raise
-    
-===== datasolver/providers/mcp/client.py =====
-"""MCP client implementation for data generation."""
+===== datasolver/providers/mcp/_shim/__init__.py =====
+"""
+Minimal stub that satisfies `from mcp_sdk import MCPClient`
+when the real SDK is not installed (e.g. during local tests).
+"""
 
+class MCPClient:                      # noqa: N801
+    def __init__(self, *_, **__):
+        pass
+
+    # no-op register (router tests only need this)
+    def register_tool(self, tool):
+        setattr(self, f"_tool_{tool.name}", tool)
+===== datasolver/providers/mcp/client.py =====
 import os
 import logging
 from typing import Dict, Any, Optional, List, Type
-from pathlib import Path
 
 from .provider import MCPProvider
 from .tools.tool import MCPTool
@@ -450,7 +495,9 @@ from .tools.tool import MCPTool
 logger = logging.getLogger('MCPClient')
 
 class MCPClient(MCPProvider):
-    """MCP client for data generation"""
+    """MCP client for data generation.
+    Supports both online (real SDK) and offline (test/stub) modes.
+    """
     
     def __init__(self, tools: Optional[List[Type[MCPTool]]] = None):
         """Initialize MCP client
@@ -460,83 +507,34 @@ class MCPClient(MCPProvider):
         """
         super().__init__()
         self._tools = {}
+        # This client object will either be the real SDK client or a simple stub
+        self.client = None 
         self._initialize_client(tools or [])
     
     def _initialize_client(self, tool_classes: List[Type[MCPTool]]):
-        """Initialize MCP client with tools
+        """Initialize MCP client with tools.
         
-        Args:
-            tool_classes: List of MCP tool classes to register
+        If MCP_SERVER_URL is set, it initializes the real SDK.
+        Otherwise, it falls back to an offline stub for testing purposes.
         """
-        try:
-            # Import MCP SDK
-            from mcp_sdk import MCPClient as SDKClient
-            
-            # Get server configuration from environment
-            server_url = os.getenv("MCP_SERVER_URL")
-            if not server_url:
-                raise ValueError("MCP_SERVER_URL must be set in .env file")
+        server_url = os.getenv("MCP_SERVER_URL")
+
+        if not server_url:
+            logger.info("MCP_SERVER_URL not set. Initializing in OFFLINE/TEST mode.")
+            # Use the simple stub/shim for local tests
+            from mcp_sdk import MCPClient as StubClient
+            self.client = StubClient()
+        else:
+            # Original logic for production/online mode
+            logger.info(f"MCP_SERVER_URL found. Initializing in ONLINE mode for {server_url}.")
+            try:
+                from mcp_sdk import MCPClient as SDKClient
                 
-            # Optional server configuration
-            server_config = {
-                "timeout": int(os.getenv("MCP_SERVER_TIMEOUT", "30")),
-                "retries": int(os.getenv("MCP_SERVER_RETRIES", "3")),
-                "api_key": os.getenv("MCP_SERVER_API_KEY"),
-                "verify_ssl": os.getenv("MCP_SERVER_VERIFY_SSL", "true").lower() == "true"
-            }
-            
-            # Initialize SDK client
-            self.client = SDKClient(server_url, **server_config)
-            
-            # Register tools
-            for tool_class in tool_classes:
-                tool = tool_class()
-                self._tools[tool.name] = tool
-                self.client.register_tool(tool)
-                logger.info(f"Registered MCP tool: {tool.name}")
-            
-            if not self._tools:
-                logger.warning("No MCP tools registered")
-            
-        except ImportError:
-            logger.error("MCP SDK not installed. Install with: pip install mcp-sdk")
-            raise
-        except Exception as e:
-            logger.error(f"Failed to initialize MCP client: {e}")
-            raise
-    
-    def register_tool(self, tool: MCPTool):
-        """Register a new MCP tool
-        
-        Args:
-            tool: MCP tool instance to register
-        """
-        self._tools[tool.name] = tool
-        self.client.register_tool(tool)
-        logger.info(f"Registered MCP tool: {tool.name}")
-    
-    def get_tool(self, tool_name: str) -> Optional[MCPTool]:
-        """Get tool by name
-        
-        Args:
-            tool_name: Name of tool to get
-            
-        Returns:
-            Tool instance if found
-        """
-        return self._tools.get(tool_name)
-    
-    def list_tools(self) -> List[str]:
-        """List available tools
-        
-        Returns:
-            List of tool names
-        """
-        return list(self._tools.keys())
-    
-    def generate_dataset(self, rfd: Dict) -> Dict[str, Any]:
-        """Generate dataset using MCP tools
-        
+                server_config = {
+                    "timeout": int(os.getenv("MCP_SERVER_TIMEOUT", "30")),
+                    "retries": int(os.getenv("MCP_SERVER_RETRIES", "3")),
+                    "api_key": os.getenv("MCP_SERVER_API_KEY"),
+                    "verify_ssl": os.getenv("MCP_SERVER_VERIFY_SSL", "true").lower() == "true"
 ===== datasolver/providers/mcp/provider.py =====
 """MCP provider implementation for the data solver."""
 
@@ -577,7 +575,58 @@ class MCPProvider(DataProvider):
         Returns:
             List of tool names that are currently registered
         """
-        pass ===== datasolver/providers/mcp/tools/dynamodb.py =====
+        pass ===== datasolver/providers/mcp/router.py =====
+import logging
+import time
+from typing import Dict, Any, List, Optional
+from .client import MCPClient
+from .tools.tool import MCPTool
+
+# Use a specific logger for the router
+log = logging.getLogger("RFDRouter")
+# To see these logs during pytest, run: poetry run pytest -o log_cli=true -o log_cli_level=INFO
+
+class RFDRouter:
+    def __init__(self, mcp: MCPClient):
+        self.mcp = mcp
+
+    def fulfil(self, rfd: Dict[str, Any]) -> Dict[str, Any]:
+        rfd_id = rfd.get("rfd_id", rfd.get("service", "unknown"))
+        log.info(f"--- Fulfilling RFD: {rfd_id} ---")
+        
+        start = time.time()
+        
+        # --- FIX: Only collect the 'records' from the dependency result, not the whole dictionary ---
+        # The recursive call returns a full dictionary {'elapsed': ..., 'records': [...]}. We only want the records.
+        dependency_records = [
+            record 
+            for dep_rfd in rfd.get("dependencies", []) 
+            for record in self.fulfil(dep_rfd)["records"]
+        ]
+        log.info(f"[{rfd_id}] Collected {len(dependency_records)} records from dependencies.")
+
+        tool = self._choose_tool(rfd)
+        if not tool:
+            log.error(f"[{rfd_id}] No tool found that can satisfy this RFD.")
+            raise RuntimeError(f"No tool can satisfy RFD: {rfd_id}")
+            
+        log.info(f"[{rfd_id}] Chose tool: '{tool.name}' (Cost: {tool.cost(rfd)})")
+        
+        generated_records = tool.generate(rfd)
+        log.info(f"[{rfd_id}] Tool '{tool.name}' generated {len(generated_records)} records.")
+
+        # The parts to be merged are now just the lists of records
+        all_parts = []
+        if dependency_records:
+            all_parts.append(dependency_records)
+        if generated_records:
+            all_parts.append(generated_records)
+        
+        log.info(f"[{rfd_id}] Passing {len(all_parts)} chunks to be merged.")
+        
+        merged_records = self._merge(all_parts, rfd.get("aggregation", "union"))
+
+===== datasolver/providers/mcp/tools/dynamodb.py =====
 """DynamoDB tool for MCP data generation."""
 
 import boto3
@@ -628,56 +677,50 @@ class DynamoDBTool(MCPTool):
             return self._validate_generation_rfd(rfd)
     
     def _is_query_request(self, rfd: Dict) -> bool:
-        """Check if RFD is a query request
-        
-        Args:
-            rfd: The RFD to check
-            
-        Returns:
-            True if RFD is a query request
-        """
-        return "query" in rfd and "table_name" in rfd["query"]
-    
-    def _validate_query_rfd(self, rfd: Dict) -> bool:
-        """Validate query RFD
-        
-        Args:
-            rfd: The RFD to validate
-            
-        Returns:
-            True if query RFD is valid
-        """
-        query = rfd.get("query", {})
-        required = {"table_name", "key_condition"}
-        return all(field in query for field in required)
-    
-    def _validate_generation_rfd(self, rfd: Dict) -> bool:
-        """Validate generation RFD
-        
-        Args:
-            rfd: The RFD to validate
-            
-        Returns:
-            True if generation RFD is valid
-        """
-        schema = rfd.get("schema", {})
-        properties = schema.get("properties", {})
-        valid_types = {"string", "number", "binary", "boolean", "null", "list", "map"}
-        return all(
-            field_schema.get("type") in valid_types
-            for field_schema in properties.values()
+===== datasolver/providers/mcp/tools/reducer.py =====
+"""ReduceAvgTool – averages numeric columns over a list of records."""
+from typing import Dict, Any, List
+from .tool import MCPTool   # local import from your providers package
+
+class ReduceAvgTool(MCPTool):
+    # -------- metadata -------- #
+    name: str = "reduce_avg"
+    description: str = "Averages (mean) every numeric field in `records`."
+
+    @property
+    def capabilities(self) -> Dict[str, Any]:
+        return {
+            "aggregation": "mean",
+            "input":  "List[Dict[str, number]]",
+            "output": "List[Dict[str, number]] (single element)"
+        }
+
+    # -------- validation -------- #
+    def validate_rfd(self, rfd: Dict[str, Any]) -> bool:
+        return (
+            rfd.get("service") == self.name
+            and isinstance(rfd.get("records"), list)
         )
-    
-    def _query_table(self, rfd: Dict) -> List[Dict[str, Any]]:
-        """Query DynamoDB table based on RFD
-        
-        Args:
-            rfd: The RFD containing query parameters
-            
-        Returns:
-            List of matching records
-        """
-        query = rfd["query"]
+
+    # -------- core generator -------- #
+    def generate_data(self, rfd: Dict[str, Any]) -> List[Dict[str, float]]:
+        records: List[Dict[str, Any]] = rfd["records"]
+        if not records:
+            return [{}]
+
+        keys = set().union(*records)
+        out: Dict[str, float] = {}
+
+        for k in keys:
+            nums = [row[k] for row in records if isinstance(row.get(k), (int, float))]
+            if nums:
+                out[k] = sum(nums) / len(nums)
+
+        return [out]   # tests expect a list with exactly one dict
+
+    # alias so tests can call .generate()
+    def generate(self, rfd: Dict[str, Any], **_) -> List[Dict[str, float]]:  # type: ignore[override]
+        return self.generate_data(rfd)
 ===== datasolver/providers/mcp/tools/text_generator.py =====
 """Text generation tool for MCP data generation."""
 
@@ -729,56 +772,6 @@ class TextGeneratorTool(MCPTool):
             
         Returns:
             True if the tool can handle the RFD, False otherwise
-        """
-        schema = rfd.get("schema", {})
-        properties = schema.get("properties", {})
-        
-        # Check if schema has any string fields
-        return any(
-            field_schema.get("type") == "string"
-            for field_schema in properties.values()
-        )
-    
-    def _get_capabilities(self) -> Dict[str, Any]:
-        """Get the tool's capabilities
-        
-        Returns:
-            Dict describing what the tool can do
-        """
-        return {
-            "supported_types": ["string"],
-            "features": [
-                "template-based generation",
-                "pattern matching",
-                "context-aware generation"
-            ],
-            "constraints": {
-                "max_length": 1000,
-                "min_length": 1
-            }
-        }
-    
-    def _generate_text(self, field_schema: Dict[str, Any]) -> str:
-        """Generate text for a field based on its schema
-        
-        Args:
-            field_schema: The schema for the field
-            
-        Returns:
-            Generated text value
-        """
-        # Implement text generation logic based on field schema
-        # This could use templates, patterns, or other generation methods
-        return f"Generated text for {field_schema.get('description', 'field')}"
-    
-    def _get_default_value(self, field_schema: Dict[str, Any]) -> Any:
-        """Get a default value for a non-string field
-        
-        Args:
-            field_schema: The schema for the field
-            
-        Returns:
-            Default value based on field type
 ===== datasolver/providers/mcp/tools/tool.py =====
 """Base class for MCP tools that handle specific data operations."""
 
@@ -830,34 +823,7 @@ class MCPTool(ABC):
             to function (e.g., required parameters, supported data types)
         """
         pass
-    
-    @abstractmethod
-    def validate_rfd(self, rfd: Dict[str, Any]) -> bool:
-        """Validate if the tool can handle the given RFD.
-        
-        Args:
-            rfd: The request for data to validate
-            
-        Returns:
-            True if the tool can handle this RFD, False otherwise
-        """
-        pass
-    
-    @abstractmethod
-    def generate_data(self, rfd: Dict[str, Any]) -> Dict[str, Any]:
-        """Generate or retrieve data according to the RFD.
-        
-        Args:
-            rfd: The request for data specifying what to generate
-            
-        Returns:
-            A dictionary containing the generated dataset
-            
-        Raises:
-            ValueError: If the RFD is invalid or requirements can't be met
-            RuntimeError: If data generation fails
-        """
-        pass ===== datasolver/providers/mock.py =====
+===== datasolver/providers/mock.py =====
 """Mock provider implementation for testing."""
 
 import random
@@ -908,45 +874,7 @@ class MockProvider(DataProvider):
         """Generate a mock value based on field schema.
         
         Args:
-            field_schema: The schema for the field
-            index: Record index
-            
-        Returns:
-            Generated mock value
-        """
-        field_type = field_schema.get("type")
-        
-        if field_type == "string":
-            if "format" in field_schema:
-                if "date" in field_schema["format"]:
-                    return f"2024-{index % 12 + 1:02d}-{index % 28 + 1:02d}"
-                elif "email" in field_schema["format"]:
-                    return f"user_{index}@example.com"
-                elif "uri" in field_schema["format"]:
-                    return f"https://example.com/resource/{index}"
-            return f"mock_value_{index}"
-            
-        elif field_type == "number":
-            return float(random.randint(1, 1000)) / 10
-            
-        elif field_type == "integer":
-            return random.randint(1, 100)
-            
-        elif field_type == "boolean":
-            return random.choice([True, False])
-            
-        elif field_type == "array":
-            item_schema = field_schema.get("items", {"type": "string"})
-            return [self._generate_mock_value(item_schema, i) for i in range(3)]
-            
-        elif field_type == "object":
-            properties = field_schema.get("properties", {})
-            return {
-                key: self._generate_mock_value(schema, index)
-                for key, schema in properties.items()
-            }
-            
-        return None ===== datasolver/providers/provider.py =====
+===== datasolver/providers/provider.py =====
 """Abstract base class for data providers."""
 
 import logging
@@ -1033,44 +961,7 @@ def upload_to_ipfs(file_path: str) -> str:
                 'file': (file_name, file)
             }
             
-            data = {
-                'pinataMetadata': pinata_metadata
-            }
-            
-            # Make the request
-            response = requests.post(url, files=files, headers=headers, data=data)
-            
-            # Check response
-            if response.status_code == 200:
-                # Extract CID from response
-                data = response.json()
-                cid = data.get('IpfsHash')
-                if not cid:
-                    raise Exception("No IPFS hash returned in response")
-                return f"ipfs://{cid}"
-            else:
-                # Handle error
-                error_message = response.text
-                try:
-                    error_data = response.json()
-                    error_message = json.dumps(error_data)
-                except json.JSONDecodeError:
-                    pass
-                raise Exception(f"Failed to upload to IPFS: {response.status_code} - {error_message}")
-                
-    except FileNotFoundError:
-        raise Exception(f"File not found at path: {file_path}")
-    except Exception as e:
-        raise Exception(f"Unexpected error during IPFS upload: {str(e)}")
-
-if __name__ == "__main__":
-    file_path = "./data/solution.json"
-    print("Current working directory:", os.getcwd())
-    try:
-        ipfs_uri = upload_to_ipfs(file_path)
-        print("Uploaded to:", ipfs_uri)
-    except Exception as e:
-        print(f"Error: {e}")===== main.py =====
+===== main.py =====
 # main.py
 """Main entry point for the solver node."""
 
@@ -1121,29 +1012,19 @@ def start(test: bool, mock: bool, rfd_file: str):
     """
     print(BANNER)
     
-    # Initialize solver node
-    try:
-        node = SolverNode(
-            test_mode=test,
-            mock_mode=mock
-        )
-    except Exception as e:
-        logger.error(f"Failed to initialize solver node: {str(e)}")
-        return
-    
-    # Run the node
-    try:
-        if test or mock:
-            node._run_test_mode()
-        else:
-            node._run_production_mode()
-    except KeyboardInterrupt:
-        logger.info("Solver node stopped by user")
-    except Exception as e:
-        logger.error(f"Solver node failed: {str(e)}")
+===== mcp_sdk/__init__.py =====
+"""
+Very small stub so `import mcp_sdk` works in unit-tests.
 
-if __name__ == '__main__':
-    cli()===== nftAuthorizer.py =====
+Only functionality the tests need is the ability to hold a
+`_tools` registry when the client is instantiated.
+"""
+class MCPClient:                       # pylint: disable=too-few-public-methods
+    def __init__(self, *_, **__):
+        self._tools = {}
+    def register_tool(self, tool):
+        self._tools[tool.name] = tool
+===== nftAuthorizer.py =====
 import os
 import json
 from typing import List, Optional
@@ -1194,56 +1075,6 @@ class NFTAuthorizer:
         except FileNotFoundError:
             raise ValueError(f"NFT contract ABI not found at {self.nft_contract_abi_path}")
         except json.JSONDecodeError:
-            raise ValueError(f"Invalid JSON in NFT contract ABI at {self.nft_contract_abi_path}")
-        except Exception as e:
-            raise ValueError(f"Failed to initialize NFT contract: {str(e)}")
-
-    def is_connected(self) -> bool:
-        """Check network connection with chain ID verification"""
-        try:
-            return self.web3.is_connected() and self.web3.eth.chain_id == self.chain_id
-        except Exception:
-            return False
-
-    def has_nft(self, wallet_address: str, block_number: Optional[int] = None) -> bool:
-        """
-        Check if a wallet address owns at least one NFT at the specified block
-        
-        Args:
-            wallet_address: The wallet address to check
-            block_number: Optional specific block number to check (defaults to latest)
-            
-        Returns:
-            bool: True if wallet owns NFT, False otherwise
-        """
-        if not self.web3.is_address(wallet_address):
-            raise ValueError(f"Invalid wallet address: {wallet_address}")
-            
-        try:
-            checksum_address = self.web3.to_checksum_address(wallet_address)
-            call_params = {'block_identifier': block_number} if block_number else {}
-            
-            balance = self.nft_contract.functions.balanceOf(checksum_address).call(call_params)
-            return balance > 0
-            
-        except ContractLogicError as e:
-            print(f"Contract error checking NFT ownership: {str(e)}")
-            return False
-        except Web3Exception as e:
-            print(f"Web3 error checking NFT ownership: {str(e)}")
-            return False
-        except Exception as e:
-            print(f"Unexpected error checking NFT ownership: {str(e)}")
-            return False
-
-    def get_owned_token_ids(self, wallet_address: str, block_number: Optional[int] = None) -> List[int]:
-        """
-        Get all token IDs owned by a wallet address at the specified block
-        
-        Args:
-            wallet_address: The wallet address to check
-            block_number: Optional specific block number to check (defaults to latest)
-            
 ===== onchain/README.md =====
 # Sample Hardhat Project
 
@@ -1309,56 +1140,6 @@ npx hardhat ignition deploy ./ignition/modules/Lock.js
       "solcConfig": {
         "version": "0.8.28",
         "settings": {
-          "evmVersion": "paris",
-          "optimizer": {
-            "enabled": false,
-            "runs": 200
-          },
-          "outputSelection": {
-            "*": {
-              "*": [
-                "abi",
-                "evm.bytecode",
-                "evm.deployedBytecode",
-                "evm.methodIdentifiers",
-                "metadata"
-              ],
-              "": [
-                "ast"
-              ]
-            }
-          }
-        }
-      },
-      "imports": [
-        "@openzeppelin/contracts/token/ERC20/ERC20.sol"
-      ],
-      "versionPragmas": [
-        "^0.8.26"
-      ],
-      "artifacts": [
-        "RewardToken"
-      ]
-    },
-    "/mnt/c/development/Axintera/solver-node/onchain/node_modules/@openzeppelin/contracts/utils/cryptography/ECDSA.sol": {
-      "lastModificationDate": 1751569772088,
-      "contentHash": "81de029d56aa803972be03c5d277cb6c",
-      "sourceName": "@openzeppelin/contracts/utils/cryptography/ECDSA.sol",
-      "solcConfig": {
-        "version": "0.8.28",
-        "settings": {
-          "evmVersion": "paris",
-          "optimizer": {
-            "enabled": false,
-            "runs": 200
-          },
-          "outputSelection": {
-            "*": {
-              "*": [
-                "abi",
-                "evm.bytecode",
-                "evm.deployedBytecode",
-                "evm.methodIdentifiers",
 ===== onchain/contracts/RewardGauge.sol =====
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
@@ -1504,56 +1285,6 @@ module.exports = {
       "contracts/RewardToken.sol": {
         "content": "// SPDX-License-Identifier: MIT\r\npragma solidity ^0.8.26;\r\nimport \"@openzeppelin/contracts/token/ERC20/ERC20.sol\";\r\n\r\ncontract RewardToken is ERC20 {\r\n    constructor() ERC20(\"Axintera Reward\", \"xREP\") {}\r\n    function mint(address to, uint256 amt) external { _mint(to, amt); }\r\n}\r\n"
       }
-    },
-    "settings": {
-      "evmVersion": "paris",
-      "optimizer": {
-        "enabled": false,
-        "runs": 200
-      },
-      "outputSelection": {
-        "*": {
-          "*": [
-            "abi",
-            "evm.bytecode",
-            "evm.deployedBytecode",
-            "evm.methodIdentifiers",
-            "metadata"
-          ],
-          "": [
-            "ast"
-          ]
-        }
-      }
-    }
-  },
-  "output": {
-    "sources": {
-      "@openzeppelin/contracts/interfaces/draft-IERC6093.sol": {
-        "ast": {
-          "absolutePath": "@openzeppelin/contracts/interfaces/draft-IERC6093.sol",
-          "exportedSymbols": {
-            "IERC1155Errors": [
-              136
-            ],
-            "IERC20Errors": [
-              41
-            ],
-            "IERC721Errors": [
-              89
-            ]
-          },
-          "id": 137,
-          "license": "MIT",
-          "nodeType": "SourceUnit",
-          "nodes": [
-            {
-              "id": 1,
-              "literals": [
-                "solidity",
-                "^",
-                "0.8",
-                ".20"
 ===== onchain/ignition/deployments/chain-545/deployed_addresses.json =====
 {
   "RewardGaugeModule#RewardGauge": "0xf6e6C656Da6F7A0B1F2AAd8AF87B6cC6f220BF6b"
@@ -1639,56 +1370,6 @@ module.exports = buildModule("RewardGaugeModule", (m) => {
       "dev": true,
       "license": "MIT",
       "peer": true,
-      "dependencies": {
-        "@jridgewell/trace-mapping": "0.3.9"
-      },
-      "engines": {
-        "node": ">=12"
-      }
-    },
-    "node_modules/@ethereumjs/rlp": {
-      "version": "5.0.2",
-      "resolved": "https://registry.npmjs.org/@ethereumjs/rlp/-/rlp-5.0.2.tgz",
-      "integrity": "sha512-DziebCdg4JpGlEqEdGgXmjqcFoJi+JGulUXwEjsZGAscAQ7MyD/7LE/GVCP29vEQxKc7AAwjT3A2ywHp2xfoCA==",
-      "dev": true,
-      "license": "MPL-2.0",
-      "bin": {
-        "rlp": "bin/rlp.cjs"
-      },
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@ethereumjs/util": {
-      "version": "9.1.0",
-      "resolved": "https://registry.npmjs.org/@ethereumjs/util/-/util-9.1.0.tgz",
-      "integrity": "sha512-XBEKsYqLGXLah9PNJbgdkigthkG7TAGvlD/sH12beMXEyHDyigfcbdvHhmLyDWgDyOJn4QwiQUaF7yeuhnjdog==",
-      "dev": true,
-      "license": "MPL-2.0",
-      "dependencies": {
-        "@ethereumjs/rlp": "^5.0.2",
-        "ethereum-cryptography": "^2.2.1"
-      },
-      "engines": {
-        "node": ">=18"
-      }
-    },
-    "node_modules/@ethereumjs/util/node_modules/@noble/curves": {
-      "version": "1.4.2",
-      "resolved": "https://registry.npmjs.org/@noble/curves/-/curves-1.4.2.tgz",
-      "integrity": "sha512-TavHr8qycMChk8UwMld0ZDRvatedkzWfH8IiaeGCfymOP5i0hSCozz9vHOL0nkwk7HRMlFnAiKpS2jrUmSybcw==",
-      "dev": true,
-      "license": "MIT",
-      "dependencies": {
-        "@noble/hashes": "1.4.0"
-      },
-      "funding": {
-        "url": "https://paulmillr.com/funding/"
-      }
-    },
-    "node_modules/@ethereumjs/util/node_modules/@noble/hashes": {
-      "version": "1.4.0",
-      "resolved": "https://registry.npmjs.org/@noble/hashes/-/hashes-1.4.0.tgz",
 ===== onchain/package.json =====
 {
   "name": "onchain",
@@ -1812,56 +1493,6 @@ class PipelineContext:
     
     def add_error(self, error: str):
         """Add an error to the context"""
-        self.errors.append(error)
-
-class PipelineStage(ABC):
-    """Abstract base class for pipeline stages"""
-    
-    def __init__(self):
-        self.logger = logging.getLogger(self.__class__.__name__)
-        self.mock_mode = os.getenv("MOCK_MODE", "false").lower() == "true"
-        self.test_mode = os.getenv("TEST_MODE", "false").lower() == "true"
-    
-    @abstractmethod
-    def process(self, context: PipelineContext) -> PipelineContext:
-        """Process the pipeline stage
-        
-        Args:
-            context: The pipeline context containing RFD and stage results
-            
-        Returns:
-            Updated pipeline context
-        """
-        pass
-    
-    @abstractmethod
-    def validate(self, context: PipelineContext) -> bool:
-        """Validate if the stage can process the context
-        
-        Args:
-            context: The pipeline context to validate
-            
-        Returns:
-            True if valid, False otherwise
-        """
-        pass
-
-class ValidationStage(PipelineStage):
-    """Validates RFD and configuration"""
-    
-    def validate(self, context: PipelineContext) -> bool:
-        required_fields = ["rfd_id", "name", "description", "schema"]
-        return all(field in context.rfd for field in required_fields)
-    
-    def process(self, context: PipelineContext) -> PipelineContext:
-        if not self.validate(context):
-            context.add_error("Invalid RFD format")
-            return context
-            
-        # Add validation logic here
-        context.add_stage_result(PipelineStageType.VALIDATION, {"valid": True})
-        return context
-
 ===== poetry.lock =====
 # This file is automatically @generated by Poetry 2.1.3 and should not be changed by hand.
 
@@ -1913,56 +1544,6 @@ files = [
     {file = "aiohttp-3.12.13-cp311-cp311-manylinux_2_5_i686.manylinux1_i686.manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:4f95db8c8b219bcf294a53742c7bda49b80ceb9d577c8e7aa075612b7f39ffb7"},
     {file = "aiohttp-3.12.13-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:03d5eb3cfb4949ab4c74822fb3326cd9655c2b9fe22e4257e2100d44215b2e2b"},
     {file = "aiohttp-3.12.13-cp311-cp311-musllinux_1_2_armv7l.whl", hash = "sha256:6383dd0ffa15515283c26cbf41ac8e6705aab54b4cbb77bdb8935a713a89bee9"},
-    {file = "aiohttp-3.12.13-cp311-cp311-musllinux_1_2_i686.whl", hash = "sha256:6548a411bc8219b45ba2577716493aa63b12803d1e5dc70508c539d0db8dbf5a"},
-    {file = "aiohttp-3.12.13-cp311-cp311-musllinux_1_2_ppc64le.whl", hash = "sha256:81b0fcbfe59a4ca41dc8f635c2a4a71e63f75168cc91026c61be665945739e2d"},
-    {file = "aiohttp-3.12.13-cp311-cp311-musllinux_1_2_s390x.whl", hash = "sha256:6a83797a0174e7995e5edce9dcecc517c642eb43bc3cba296d4512edf346eee2"},
-    {file = "aiohttp-3.12.13-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:a5734d8469a5633a4e9ffdf9983ff7cdb512524645c7a3d4bc8a3de45b935ac3"},
-    {file = "aiohttp-3.12.13-cp311-cp311-win32.whl", hash = "sha256:fef8d50dfa482925bb6b4c208b40d8e9fa54cecba923dc65b825a72eed9a5dbd"},
-    {file = "aiohttp-3.12.13-cp311-cp311-win_amd64.whl", hash = "sha256:9a27da9c3b5ed9d04c36ad2df65b38a96a37e9cfba6f1381b842d05d98e6afe9"},
-    {file = "aiohttp-3.12.13-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:0aa580cf80558557285b49452151b9c69f2fa3ad94c5c9e76e684719a8791b73"},
-    {file = "aiohttp-3.12.13-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:b103a7e414b57e6939cc4dece8e282cfb22043efd0c7298044f6594cf83ab347"},
-    {file = "aiohttp-3.12.13-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:78f64e748e9e741d2eccff9597d09fb3cd962210e5b5716047cbb646dc8fe06f"},
-    {file = "aiohttp-3.12.13-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:29c955989bf4c696d2ededc6b0ccb85a73623ae6e112439398935362bacfaaf6"},
-    {file = "aiohttp-3.12.13-cp312-cp312-manylinux_2_17_armv7l.manylinux2014_armv7l.manylinux_2_31_armv7l.whl", hash = "sha256:d640191016763fab76072c87d8854a19e8e65d7a6fcfcbf017926bdbbb30a7e5"},
-    {file = "aiohttp-3.12.13-cp312-cp312-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:4dc507481266b410dede95dd9f26c8d6f5a14315372cc48a6e43eac652237d9b"},
-    {file = "aiohttp-3.12.13-cp312-cp312-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:8a94daa873465d518db073bd95d75f14302e0208a08e8c942b2f3f1c07288a75"},
-    {file = "aiohttp-3.12.13-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:177f52420cde4ce0bb9425a375d95577fe082cb5721ecb61da3049b55189e4e6"},
-    {file = "aiohttp-3.12.13-cp312-cp312-manylinux_2_5_i686.manylinux1_i686.manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:0f7df1f620ec40f1a7fbcb99ea17d7326ea6996715e78f71a1c9a021e31b96b8"},
-    {file = "aiohttp-3.12.13-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:3062d4ad53b36e17796dce1c0d6da0ad27a015c321e663657ba1cc7659cfc710"},
-    {file = "aiohttp-3.12.13-cp312-cp312-musllinux_1_2_armv7l.whl", hash = "sha256:8605e22d2a86b8e51ffb5253d9045ea73683d92d47c0b1438e11a359bdb94462"},
-    {file = "aiohttp-3.12.13-cp312-cp312-musllinux_1_2_i686.whl", hash = "sha256:54fbbe6beafc2820de71ece2198458a711e224e116efefa01b7969f3e2b3ddae"},
-    {file = "aiohttp-3.12.13-cp312-cp312-musllinux_1_2_ppc64le.whl", hash = "sha256:050bd277dfc3768b606fd4eae79dd58ceda67d8b0b3c565656a89ae34525d15e"},
-    {file = "aiohttp-3.12.13-cp312-cp312-musllinux_1_2_s390x.whl", hash = "sha256:2637a60910b58f50f22379b6797466c3aa6ae28a6ab6404e09175ce4955b4e6a"},
-    {file = "aiohttp-3.12.13-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:e986067357550d1aaa21cfe9897fa19e680110551518a5a7cf44e6c5638cb8b5"},
-    {file = "aiohttp-3.12.13-cp312-cp312-win32.whl", hash = "sha256:ac941a80aeea2aaae2875c9500861a3ba356f9ff17b9cb2dbfb5cbf91baaf5bf"},
-    {file = "aiohttp-3.12.13-cp312-cp312-win_amd64.whl", hash = "sha256:671f41e6146a749b6c81cb7fd07f5a8356d46febdaaaf07b0e774ff04830461e"},
-    {file = "aiohttp-3.12.13-cp313-cp313-macosx_10_13_universal2.whl", hash = "sha256:d4a18e61f271127465bdb0e8ff36e8f02ac4a32a80d8927aa52371e93cd87938"},
-    {file = "aiohttp-3.12.13-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:532542cb48691179455fab429cdb0d558b5e5290b033b87478f2aa6af5d20ace"},
-    {file = "aiohttp-3.12.13-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:d7eea18b52f23c050ae9db5d01f3d264ab08f09e7356d6f68e3f3ac2de9dfabb"},
-    {file = "aiohttp-3.12.13-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:ad7c8e5c25f2a26842a7c239de3f7b6bfb92304593ef997c04ac49fb703ff4d7"},
-    {file = "aiohttp-3.12.13-cp313-cp313-manylinux_2_17_armv7l.manylinux2014_armv7l.manylinux_2_31_armv7l.whl", hash = "sha256:6af355b483e3fe9d7336d84539fef460120c2f6e50e06c658fe2907c69262d6b"},
-    {file = "aiohttp-3.12.13-cp313-cp313-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:a95cf9f097498f35c88e3609f55bb47b28a5ef67f6888f4390b3d73e2bac6177"},
-    {file = "aiohttp-3.12.13-cp313-cp313-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:b8ed8c38a1c584fe99a475a8f60eefc0b682ea413a84c6ce769bb19a7ff1c5ef"},
-    {file = "aiohttp-3.12.13-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:7a0b9170d5d800126b5bc89d3053a2363406d6e327afb6afaeda2d19ee8bb103"},
-    {file = "aiohttp-3.12.13-cp313-cp313-manylinux_2_5_i686.manylinux1_i686.manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:372feeace612ef8eb41f05ae014a92121a512bd5067db8f25101dd88a8db11da"},
-    {file = "aiohttp-3.12.13-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:a946d3702f7965d81f7af7ea8fb03bb33fe53d311df48a46eeca17e9e0beed2d"},
-    {file = "aiohttp-3.12.13-cp313-cp313-musllinux_1_2_armv7l.whl", hash = "sha256:a0c4725fae86555bbb1d4082129e21de7264f4ab14baf735278c974785cd2041"},
-    {file = "aiohttp-3.12.13-cp313-cp313-musllinux_1_2_i686.whl", hash = "sha256:9b28ea2f708234f0a5c44eb6c7d9eb63a148ce3252ba0140d050b091b6e842d1"},
-    {file = "aiohttp-3.12.13-cp313-cp313-musllinux_1_2_ppc64le.whl", hash = "sha256:d4f5becd2a5791829f79608c6f3dc745388162376f310eb9c142c985f9441cc1"},
-    {file = "aiohttp-3.12.13-cp313-cp313-musllinux_1_2_s390x.whl", hash = "sha256:60f2ce6b944e97649051d5f5cc0f439360690b73909230e107fd45a359d3e911"},
-    {file = "aiohttp-3.12.13-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:69fc1909857401b67bf599c793f2183fbc4804717388b0b888f27f9929aa41f3"},
-    {file = "aiohttp-3.12.13-cp313-cp313-win32.whl", hash = "sha256:7d7e68787a2046b0e44ba5587aa723ce05d711e3a3665b6b7545328ac8e3c0dd"},
-    {file = "aiohttp-3.12.13-cp313-cp313-win_amd64.whl", hash = "sha256:5a178390ca90419bfd41419a809688c368e63c86bd725e1186dd97f6b89c2706"},
-    {file = "aiohttp-3.12.13-cp39-cp39-macosx_10_9_universal2.whl", hash = "sha256:36f6c973e003dc9b0bb4e8492a643641ea8ef0e97ff7aaa5c0f53d68839357b4"},
-    {file = "aiohttp-3.12.13-cp39-cp39-macosx_10_9_x86_64.whl", hash = "sha256:6cbfc73179bd67c229eb171e2e3745d2afd5c711ccd1e40a68b90427f282eab1"},
-    {file = "aiohttp-3.12.13-cp39-cp39-macosx_11_0_arm64.whl", hash = "sha256:1e8b27b2d414f7e3205aa23bb4a692e935ef877e3a71f40d1884f6e04fd7fa74"},
-    {file = "aiohttp-3.12.13-cp39-cp39-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:eabded0c2b2ef56243289112c48556c395d70150ce4220d9008e6b4b3dd15690"},
-    {file = "aiohttp-3.12.13-cp39-cp39-manylinux_2_17_armv7l.manylinux2014_armv7l.manylinux_2_31_armv7l.whl", hash = "sha256:003038e83f1a3ff97409999995ec02fe3008a1d675478949643281141f54751d"},
-    {file = "aiohttp-3.12.13-cp39-cp39-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:1b6f46613031dbc92bdcaad9c4c22c7209236ec501f9c0c5f5f0b6a689bf50f3"},
-    {file = "aiohttp-3.12.13-cp39-cp39-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:c332c6bb04650d59fb94ed96491f43812549a3ba6e7a16a218e612f99f04145e"},
-    {file = "aiohttp-3.12.13-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:3fea41a2c931fb582cb15dc86a3037329e7b941df52b487a9f8b5aa960153cbd"},
-    {file = "aiohttp-3.12.13-cp39-cp39-manylinux_2_5_i686.manylinux1_i686.manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:846104f45d18fb390efd9b422b27d8f3cf8853f1218c537f36e71a385758c896"},
-    {file = "aiohttp-3.12.13-cp39-cp39-musllinux_1_2_aarch64.whl", hash = "sha256:5d6c85ac7dd350f8da2520bac8205ce99df4435b399fa7f4dc4a70407073e390"},
 ===== pyproject.toml =====
 [project]
 name = "axintera"
@@ -1982,7 +1563,8 @@ dependencies = [
     "json5 (>=0.12.0,<0.13.0)",
     "sqlmodel (>=0.0.24,<0.0.25)",
     "fastapi (>=0.115.14,<0.116.0)",
-    "uvicorn (>=0.35.0,<0.36.0)"
+    "uvicorn (>=0.35.0,<0.36.0)",
+    "httpx (>=0.28.1,<0.29.0)"
 ]
 
 
@@ -1997,6 +1579,57 @@ pytest-mock = "^3.14.1"
 ruff = "^0.12.2"
 black = "^25.1.0"
 
+===== repo_contents.txt =====
+===== mock_mcp_server.py =====
+# mock_mcp_server.py
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, HttpUrl
+from typing import List, Dict, Any
+import httpx
+import logging
+import uvicorn
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("MockMCPServer")
+
+app = FastAPI(title="Mock MCP Server")
+
+SOLVER_REGISTRY: Dict[str, str] = {}
+
+class SolverInfo(BaseModel):
+    solver_url: str
+    tools: List[str]
+
+@app.get("/")
+def read_root():
+    return {"message": "Mock MCP Server is running", "registry": SOLVER_REGISTRY}
+
+@app.post("/register")
+async def register_solver(info: SolverInfo):
+    for tool in info.tools:
+        SOLVER_REGISTRY[tool] = str(info.solver_url)
+        logger.info(f"Registered tool '{tool}' for solver at {info.solver_url}")
+    return {"status": "success", "message": f"Registered {len(info.tools)} tools."}
+
+@app.post("/fulfill")
+async def fulfill_rfd(rfd: Dict[str, Any]):
+    service_needed = rfd.get("service")
+    if not service_needed:
+        raise HTTPException(status_code=400, detail="RFD must include a 'service' key.")
+
+    logger.info(f"Received RFD for service: '{service_needed}'")
+
+    if service_needed not in SOLVER_REGISTRY:
+        logger.error(f"No solver found for service: '{service_needed}'")
+        raise HTTPException(status_code=404, detail=f"No solver registered for service '{service_needed}'")
+
+    solver_url = SOLVER_REGISTRY[service_needed]
+    forward_url = f"{solver_url}/execute_rfd"
+    
+    logger.info(f"Forwarding RFD to solver at: {forward_url}")
+
+    async with httpx.AsyncClient() as client:
+        try:
 ===== reputation.py =====
 """
 reputation.py – Axintera lightweight telemetry
@@ -2048,34 +1681,6 @@ def update_stats(provider_id: str, ok: bool) -> None:
             """,
             (provider_id.lower(), int(ok), int(ok)),
         )
-        c.commit()
-
-# ─── scoring helpers ────────────────────────────────────────────────
-def wilson(success: int, served: int, z: float = 1.96) -> float:
-    """95 % Wilson lower-bound."""
-    if served == 0:
-        return 0.0
-    phat  = success / served
-    denom = 1 + z**2 / served
-    centre = phat + z**2 / (2 * served)
-    adj   = z * math.sqrt((phat * (1 - phat) + z**2 / (4 * served)) / served)
-    return round((centre - adj) / denom, 4)
-
-async def hourly_recalc() -> None:
-    """Recompute score for every provider once per hour."""
-    while True:
-        with _LOCK, sqlite3.connect(DB_PATH) as c:
-            rows = c.execute(
-                "SELECT provider_id, served, success FROM providerstat"
-            ).fetchall()
-            for pid, served, success in rows:
-                score = wilson(success, served)
-                c.execute(
-                    "UPDATE providerstat SET score=? WHERE provider_id=?",
-                    (score, pid),
-                )
-            c.commit()
-        await asyncio.sleep(3600)          # lower during demos if you like
 ===== requirements.txt =====
 # Web3 and Ethereum interaction
 web3>=6.10.0
@@ -2154,15 +1759,7 @@ class RFDListener:
                     print(f"New RFD detected: ID={rfd['rfd_id']}, Name={rfd['name']}")
                     callback(rfd)
             except Exception as e:
-                print(f"Error listening for RFDs: {str(e)}")
-            time.sleep(10)  # Poll every 10 seconds
-
-if __name__ == "__main__":
-    def dummy_callback(rfd: Dict):
-        print(f"Processing RFD: {rfd}")
-
-    listener = RFDListener()
-    listener.listen_for_rfds(dummy_callback)===== sample_rfd.json =====
+===== sample_rfd.json =====
 {
   "rfd_id": "test_rfd_001",
   "name": "Test RFD for Mock Data Generation",
@@ -2263,104 +1860,54 @@ def get_score(provider_id: str):
 ===== solverNode.py =====
 # solverNode.py
 """
-Main orchestration script for the Reppo solver node + Axintera reputation layer
-───────────────────────────────────────────────────────────────────────────────
-Modes
- • MOCK  – local run, fake wallet, no chain/IPFS
- • TEST  – real data generation, skips on-chain calls
- • PROD  – full pipeline (NFT check, IPFS, submitSolution)
+Main orchestration script for the Reppo solver node.
 
-Reputation layer
- • Creates   state/stats.db            (see reputation.py)
- • Records   served / success counters per wallet address
+This script runs the solver as a persistent API server. On startup, it
+registers itself with the Mock MCP Server (defined in the .env file).
+It then listens for incoming RFD execution requests on the /execute_rfd endpoint.
 """
 
-import os, json, time, logging
+import os
+import json
+import time
+import logging
 from typing import Dict, Optional, List, Type
+
+import requests
 from dotenv import load_dotenv
+from fastapi import FastAPI, Request, HTTPException
+import uvicorn
 
-# ─── Reppo skeleton imports ────────────────────────────────────────────
-from rfdListener import RFDListener
-from datasolver   import DataSolver
-from ipfsUploader import upload_to_ipfs
-from nftAuthorizer import NFTAuthorizer
-from submitSolution import SolutionSubmitter
+# --- Project-specific Imports ---
+# Assuming these files are in the same directory or accessible via PYTHONPATH
+from datasolver import DataSolver
+from datasolver.providers.mcp.router import RFDRouter
+from datasolver.providers.mcp.tools.reducer import ReduceAvgTool
+# Add any other tools you create here, e.g., from .tools.sports_odds import SportsOddsTool
 
-# ─── Axintera reputation helper (single-file) ─────────────────────────
-# solverNode.py  – top of file, just after the other imports
-import threading, asyncio, uvicorn, reputation
-import score_service                   # <- the FastAPI app you created
+import reputation
+import score_service
 
-# kick off background tasks once at start-up
-reputation.init_db()
-threading.Thread(target=lambda: asyncio.run(reputation.hourly_recalc()),
-                 daemon=True).start()
-threading.Thread(target=lambda: uvicorn.run("score_service:app",
-                                            host="0.0.0.0", port=8000,
-                                            log_level="warning"),
-                 daemon=True).start()
-
-# ─── logging config ───────────────────────────────────────────────────
+# --- Setup Logging and Environment ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 LOGGER = logging.getLogger("SolverNode")
+load_dotenv()
 
-# ──────────────────────────────────────────────────────────────────────
+# --- Initialize FastAPI App for the Solver Node ---
+# This app will listen for requests from the MCP server
+app = FastAPI(title="Reppo Solver Node")
+
+
 class SolverNode:
+    """
+    The main solver node class. Manages data generation, reputation,
+    and communication with the MCP network.
+    """
     def __init__(
-        self,
-        test_mode: bool = False,
-        mock_mode: bool = False,
-        mcp_tools: Optional[List[Type]] = None,
-    ):
-        """
-        Args:
-            test_mode: process a local sample RFD, no chain calls
-            mock_mode: generate mock data + mock tx hash (dev only)
-            mcp_tools: optional list of MCP tool classes to inject
-        """
-        self.test_mode  = test_mode
-        self.mock_mode  = mock_mode
-        self.mcp_tools  = mcp_tools
-
-        load_dotenv()
-
-        # wallet address
-        self.wallet_address = (
-            "0xMockWalletAddress" if self.mock_mode else os.getenv("WALLET_ADDRESS")
-        )
-        if not self.wallet_address:
-            raise ValueError("WALLET_ADDRESS must be set in .env")
-
-        # core solver
-        self.solver = DataSolver.from_env(mock_mode=self.mock_mode)
-
-        # supporting components (skip in mock / test)
-        if self.mock_mode or self.test_mode:
-            self.authorizer = None
-            self.submitter  = None
-            self.listener   = None
-        else:
-            self.authorizer = NFTAuthorizer()
-            self.submitter  = SolutionSubmitter()
-            self.listener   = RFDListener()
-
-        self._print_mode_banner()
-
-    # ──────────────────────────────────────────────────────────────
-    def _print_mode_banner(self):
-        if self.mock_mode:
-            mode = "MOCK"
-            details = [
-                "mock data generation",
-                "mock blockchain responses",
-                "no external services",
-            ]
-        elif self.test_mode:
-            mode = "TEST"
 ===== submitSolution.py =====
 #!/usr/bin/env python
 import os, json, logging
@@ -2412,31 +1959,76 @@ class SolutionSubmitter:
             if not cid_uri:
                 raise RuntimeError("IPFS upload failed")
 
-            nonce = self.w3.eth.get_transaction_count(self.acct.address)
-            tx    = self.contract.functions.submitSolution(rfd_id, cid_uri).build_transaction(
-                {"from": self.acct.address, "nonce": nonce, "gas": self.GAS_LIMIT,
-                 "gasPrice": self.w3.eth.gas_price, "chainId": self.chain_id}
-            )
-            signed  = self.w3.eth.account.sign_transaction(tx, self.pk)
-            tx_hash = self.w3.eth.send_raw_transaction(signed.rawTransaction)
-            log.info("✅ submitSolution tx %s", self.w3.to_hex(tx_hash))
-
-            reputation.update_stats(PROVIDER_ID, True)
-            return self.w3.to_hex(tx_hash)
-
-        except Exception as exc:                       # noqa: BLE001
-            log.error("❌ submitSolution failed: %s", exc)
-            reputation.update_stats(PROVIDER_ID, False)
-            return None
-
-    def is_connected(self) -> bool:
-        return self.w3.is_connected() and self.w3.eth.chain_id == self.chain_id
+===== tests/_stubs/mcp_sdk/__init__.py =====
+"""Ultra-minimal stub so `import mcp_sdk` succeeds in unit-tests."""
+class MCPClient:                       # pylint: disable=too-few-public-methods
+    def __init__(self, *_, **__):
+        self._tools = {}
+    def register_tool(self, tool):
+        self._tools[tool.name] = tool
 ===== tests/conftest.py =====
 import sys, pathlib
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-===== tests/test_scoring.py =====
+===== tests/test_reducer.py =====
+from datasolver.providers.mcp.tools.reducer import ReduceAvgTool
+
+def test_avg():
+    tool = ReduceAvgTool()
+    rfd = {"service":"reduce_avg",
+           "records":[{"x":1,"y":2},{"x":3,"y":4}]}
+    assert tool.generate(rfd) == [{"x":2,"y":3}]
+===== tests/test_router.py =====
+import pytest
+from datasolver.providers.mcp.router import RFDRouter
+from datasolver.providers.mcp.client import MCPClient
+from datasolver.providers.mcp.tools.tool import MCPTool
+
+# Fully implement the abstract methods from MCPTool
+class EchoTool(MCPTool):
+    @property
+    def name(self) -> str:
+        return "echo"
+
+    @property
+    def description(self) -> str:
+        return "A simple tool that returns its input payload."
+
+    @property
+    def capabilities(self) -> dict:
+        return {"input": "Any JSON with a 'payload' key", "output": "The payload value"}
+    
+    def validate_rfd(self, rfd: dict) -> bool:
+        return rfd.get("service") == self.name
+
+    def generate_data(self, rfd: dict) -> list:
+        return [{"echo": rfd.get("payload", "hi")}]
+
+    # The router directly calls a 'generate' method on the tool
+    def generate(self, rfd: dict, **kwargs) -> list:
+        return self.generate_data(rfd)
+
+    def cost(self, rfd: dict) -> float:
+        return 10
+
+@pytest.fixture
+def router():
+    # MCPClient now handles offline mode correctly without needing env vars
+    mcp = MCPClient(tools=[EchoTool])
+    return RFDRouter(mcp)
+
+def test_single(router):
+    rfd = {"service":"echo","payload":"ping"}
+    out = router.fulfil(rfd)
+    assert out["records"] == [{"echo":"ping"}]
+
+def test_chain(router):
+    child = {"service":"echo","payload":"child"}
+    root  = {"service":"echo","payload":"root",
+             "dependencies":[child],"aggregation":"concat"}
+    recs = router.fulfil(root)["records"]
+    assert recs == [{"echo":"child"},{"echo":"root"}]===== tests/test_scoring.py =====
 from reputation import wilson
 
 def test_wilson_values():

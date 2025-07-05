@@ -3,15 +3,36 @@ from datasolver.providers.mcp.router import RFDRouter
 from datasolver.providers.mcp.client import MCPClient
 from datasolver.providers.mcp.tools.tool import MCPTool
 
-# dummy tool
+# Fully implement the abstract methods from MCPTool
 class EchoTool(MCPTool):
-    def __init__(self): super().__init__("echo","returns echo")
-    def validate_rfd(self,rfd): return rfd.get("service")=="echo"
-    def generate(self,rfd,**k): return [{"echo": rfd.get("payload","hi")}]
-    def cost(self,r): return 10
+    @property
+    def name(self) -> str:
+        return "echo"
+
+    @property
+    def description(self) -> str:
+        return "A simple tool that returns its input payload."
+
+    @property
+    def capabilities(self) -> dict:
+        return {"input": "Any JSON with a 'payload' key", "output": "The payload value"}
+    
+    def validate_rfd(self, rfd: dict) -> bool:
+        return rfd.get("service") == self.name
+
+    def generate_data(self, rfd: dict) -> list:
+        return [{"echo": rfd.get("payload", "hi")}]
+
+    # The router directly calls a 'generate' method on the tool
+    def generate(self, rfd: dict, **kwargs) -> list:
+        return self.generate_data(rfd)
+
+    def cost(self, rfd: dict) -> float:
+        return 10
 
 @pytest.fixture
 def router():
+    # MCPClient now handles offline mode correctly without needing env vars
     mcp = MCPClient(tools=[EchoTool])
     return RFDRouter(mcp)
 
