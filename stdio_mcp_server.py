@@ -2,10 +2,9 @@
 """
 Standard MCP Server (JSON-RPC 2.0 over stdin/stdout) for Amazon Q
 
-* Advertises three tools:
-    • generate_data   (synthetic demo – local)
-    • query_data      (synthetic demo – local)
-    • yield_matrix    (REAL – forwards to Reppo router /fulfill)
+* FINAL HARDCODED VERSION - GUARANTEED TO LOAD *
+This is the user's working file with the new tool logic added manually
+and hardcoded to prevent any possible crash.
 """
 
 import json, sys, logging, os, httpx
@@ -31,6 +30,21 @@ YIELD_INPUT_SCHEMA = {
     },
     "required": ["chains", "assets"],
 }
+
+# --- NEW: Schema for our new tool ---
+FLOW_YIELD_GATE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "user_address": {"type": "string", "description": "The user's wallet address (e.g., 0x...)."},
+        "nft_collections": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "A list of NFT collection identifiers to check."
+        }
+    },
+    "required": ["user_address", "nft_collections"]
+}
+
 
 # ─────────────────────────  server class  ─────────────────────
 class MCPServer:
@@ -68,6 +82,12 @@ class MCPServer:
                 "name": "yield_matrix",
                 "description": "Aggregates on-chain yield opportunities",
                 "inputSchema": YIELD_INPUT_SCHEMA,
+            },
+            # --- The new tool definition ---
+            {
+                "name": "flow_yield_gate",
+                "description": "HARDCODED: Get Flow EVM gated yield opportunities.",
+                "inputSchema": FLOW_YIELD_GATE_SCHEMA,
             },
         ]
 
@@ -109,6 +129,9 @@ class MCPServer:
                     return self._query_data(mid, args)
                 if name == "yield_matrix":
                     return self._call_yield_matrix(mid, args)
+                # --- The new tool dispatch ---
+                if name == "flow_yield_gate":
+                    return self._call_flow_yield_gate(mid, args)
 
                 return {
                     "jsonrpc": "2.0",
@@ -165,6 +188,26 @@ class MCPServer:
             }
 
         return self._simple_text_result(mid, json.dumps(data, indent=2))
+
+    # --- The new, self-contained, hardcoded tool implementation ---
+    def _call_flow_yield_gate(self, mid: int, args: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            log.info(f"Executing hardcoded 'flow_yield_gate' with args: {args}")
+            user_address = args.get("user_address", "not_provided")
+            is_premium_user = user_address.lower() == "0x123"
+
+            if is_premium_user:
+                response_data = {"status": "success_simulated", "user_address": user_address, "nft_score": 150, "reputation": 1250, "premium_access": True, "available_yields": [{"protocol": "FlowLend", "asset": "USDC", "apy": 4.5, "tier": "basic"}, {"protocol": "FlowLend", "asset": "USDC", "apy": 7.8, "tier": "premium_unlocked"}]}
+            else:
+                response_data = {"status": "success_simulated", "user_address": user_address, "nft_score": 0, "reputation": 300, "premium_access": False, "available_yields": [{"protocol": "FlowLend", "asset": "USDC", "apy": 4.5, "tier": "basic"}]}
+            
+            result_text = json.dumps(response_data, indent=2)
+            return self._simple_text_result(mid, result_text)
+            
+        except Exception as e:
+            log.error(f"FATAL ERROR in _call_flow_yield_gate: {e}", exc_info=True)
+            return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32000, "message": str(e)}}
+
 
     # ---------- helpers ------------------------------------------------------
     def _simple_text_result(self, mid: int, txt: str) -> Dict[str, Any]:
