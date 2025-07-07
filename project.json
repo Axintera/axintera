@@ -1,0 +1,29 @@
+{
+  "name": "Axintera SolverNode",
+  "description": "A decentralized solver node implementation with support for MCP tools, data routing, scoring, and on-chain interaction.",
+  "version": "1.0.0",
+  "license": "MIT",
+  "authors": [
+    "Octavio Alatorre",
+    "Ricardo Lopez"
+  ],
+  "entrypoint": "main.py",
+  "dependencies": [
+    "mcp_sdk",
+    "requests",
+    "web3",
+    "python-dotenv",
+    "flask",
+    "pandas"
+  ],
+  "tags": [
+    "solvernode",
+    "mcp",
+    "python",
+    "decentralized",
+    "data-processing"
+  ],
+  "repository": "https://github.com/Axintera/axintera",
+  "network": "PL Testnet",
+  "type": "solver-node"
+}
